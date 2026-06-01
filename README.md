@@ -21,7 +21,7 @@ simulations — all configured and launched from the FreeCAD GUI.
 
 3. Open your browser to:
    ```
-   http://localhost:6080/vnc.html?autoconnect=1&resize=remote
+   http://localhost:6080/vnc.html?autoconnect=1&resize=scale
    ```
    FreeCAD starts automatically. Switch to the **Palace** workbench from
    the workbench dropdown in the toolbar.
@@ -54,7 +54,7 @@ Copy these into your local `projects/` directory to run them inside the containe
 ## Troubleshooting
 
 **Port 6080 already in use:** Edit `docker-compose.yml`, change `"6080:6080"` to
-`"6081:6080"`, and navigate to `http://localhost:6081/vnc.html?autoconnect=1&resize=remote`.
+`"6081:6080"`, and navigate to `http://localhost:6081/vnc.html?autoconnect=1&resize=scale`.
 
 **FreeCAD doesn't start after an update:** Docker caches images locally, so `docker compose up`
 may still run an older version even after a new release. Force a refresh with:
@@ -63,6 +63,16 @@ docker compose pull
 docker compose down
 docker compose up
 ```
+
+**FreeCAD window appears zoomed in / only part of the window is visible:** This is a noVNC
+scaling issue on HiDPI (Retina) displays. Make sure you are using the `resize=scale` URL
+parameter (included in the link above). If you connected with a different URL previously,
+the VNC session may have already resized itself incorrectly — restart it with:
+```
+docker compose down
+docker compose up
+```
+Then open the browser link printed in the terminal output.
 
 **FreeCAD doesn't start (first install):** Run `docker compose logs` to see error output.
 
