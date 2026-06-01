@@ -83,3 +83,34 @@ Then open the browser link printed in the terminal output.
 If you already have FreeCAD 1.0 and Palace installed natively, install the workbench via
 **Tools → Addon Manager → Install from URL** using this repository's URL.
 Set the Palace binary path in the Simulation object properties after installation.
+
+## Acknowledgements
+
+This project would not be possible without the following open-source projects:
+
+- **[Palace](https://github.com/awslabs/palace)** (AWS Labs) — the electromagnetic
+  FEM solver that powers all simulations.
+
+- **[FreeCAD](https://www.freecad.org)** — the open-source parametric CAD platform
+  this workbench extends.
+
+- **[Gmsh](https://gmsh.info)** (Christophe Geuzaine & Jean-François Remacle) — the
+  finite element mesh generator used to produce volumetric meshes from CAD geometry.
+
+- **[NumPy](https://numpy.org)**, **[Matplotlib](https://matplotlib.org)**, and
+  **[SciPy](https://scipy.org)** — scientific Python libraries used for post-processing
+  and visualization.
+
+## License
+
+The Palace Workbench source code (the Python files in this repository) is released
+under the **MIT License**.
+
+The Docker image bundles several third-party packages under their own licenses:
+FreeCAD (LGPL 2.1+), Palace (Apache 2.0), Gmsh (GPL 2+), and others. Those
+licenses govern their respective components and are unaffected by this project's
+MIT license.
+
+---
+
+*This project was developed with the assistance of [Claude Code](https://claude.ai/code) by Anthropic.*
