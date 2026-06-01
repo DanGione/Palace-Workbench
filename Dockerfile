@@ -74,8 +74,8 @@ RUN printf '#!/bin/bash\nexport LIBGL_ALWAYS_SOFTWARE=1\nexec openbox-session\n'
         > /home/${USERNAME}/.vnc/xstartup \
     && chmod +x /home/${USERNAME}/.vnc/xstartup
 
-# Use explicit conda path so the binary is found regardless of PATH init order
-RUN printf '#!/bin/bash\n/opt/conda/bin/FreeCAD &\n' \
+# Openbox autostart: launch FreeCAD automatically when the desktop starts
+RUN printf '#!/bin/bash\nfreecad &\n' \
         > /home/${USERNAME}/.config/openbox/autostart \
     && chmod +x /home/${USERNAME}/.config/openbox/autostart
 
