@@ -56,7 +56,15 @@ Copy these into your local `projects/` directory to run them inside the containe
 **Port 6080 already in use:** Edit `docker-compose.yml`, change `"6080:6080"` to
 `"6081:6080"`, and navigate to `http://localhost:6081/vnc.html?autoconnect=1&resize=remote`.
 
-**FreeCAD doesn't start:** Run `docker compose logs` to see error output.
+**FreeCAD doesn't start after an update:** Docker caches images locally, so `docker compose up`
+may still run an older version even after a new release. Force a refresh with:
+```
+docker compose pull
+docker compose down
+docker compose up
+```
+
+**FreeCAD doesn't start (first install):** Run `docker compose logs` to see error output.
 
 **Palace workbench missing:** Go to **Edit → Preferences → Workbenches** and enable "Palace".
 
