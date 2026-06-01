@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- axes -->
+  <line x1="8" y1="56" x2="58" y2="56" stroke="#444" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="8" y1="56" x2="8"  y2="6"  stroke="#444" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- S21 line (blue, near 0 dB) -->
+  <polyline points="8,46 18,44 28,43 38,42 48,41 58,40"
+            fill="none" stroke="#2196F3" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- S11 line (red, sloping down) -->
+  <polyline points="8,20 18,26 28,33 38,40 48,47 58,52"
+            fill="none" stroke="#F44336" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- axis tick marks -->
+  <line x1="8"  y1="56" x2="8"  y2="59" stroke="#444" stroke-width="1.5"/>
+  <line x1="21" y1="56" x2="21" y2="59" stroke="#444" stroke-width="1.5"/>
+  <line x1="34" y1="56" x2="34" y2="59" stroke="#444" stroke-width="1.5"/>
+  <line x1="47" y1="56" x2="47" y2="59" stroke="#444" stroke-width="1.5"/>
+  <line x1="58" y1="56" x2="58" y2="59" stroke="#444" stroke-width="1.5"/>
+</svg>

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Group background -->
+  <rect x="4" y="10" width="56" height="44" rx="5" fill="#C8E6C9" stroke="#2E7D32" stroke-width="2.5"/>
+  <!-- Inner material block -->
+  <rect x="12" y="18" width="40" height="28" rx="3" fill="#4CAF50" fill-opacity="0.5"/>
+  <!-- Epsilon symbol -->
+  <text x="27" y="42" font-family="serif" font-size="26" font-weight="bold" fill="#1B5E20">&#949;</text>
+  <!-- subscript r -->
+  <text x="44" y="45" font-family="serif" font-size="14" fill="#1B5E20">r</text>
+</svg>

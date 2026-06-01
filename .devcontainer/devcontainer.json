@@ -1,0 +1,36 @@
+{
+  "name": "Empire Simulator",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "vscode",
+  "forwardPorts": [6080, 5901],
+  "portsAttributes": {
+    "6080": {
+      "label": "FreeCAD GUI (browser)",
+      "onAutoForward": "openBrowser"
+    },
+    "5901": {
+      "label": "FreeCAD GUI (VNC)",
+      "onAutoForward": "silent"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.debugpy",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/bin/python",
+        "python.terminal.activateEnvironment": false
+      }
+    }
+  },
+  "postStartCommand": "./.devcontainer/start-gui.sh"
+}

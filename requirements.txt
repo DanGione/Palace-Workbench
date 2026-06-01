@@ -1,0 +1,7 @@
+# Auto-installed on first Palace workbench activation (see PalaceWorkbench.py):
+matplotlib
+numpy
+
+# Installed on first use of the Mesh command — handled lazily due to size ~100 MB
+# (see palace/meshing.py _gmsh()). Also installable manually: pip install gmsh
+gmsh

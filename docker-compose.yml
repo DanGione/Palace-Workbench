@@ -1,0 +1,9 @@
+services:
+  palace-workbench:
+    image: ghcr.io/dangione/palace-workbench:latest
+    ports:
+      - "6080:6080"
+      - "5901:5901"
+    volumes:
+      - ./projects:/projects
+    restart: unless-stopped

@@ -1,0 +1,201 @@
+"""
+CoaxThru_test.FCMacro
+=====================
+Creates a short 50-ohm air-filled coaxial through structure and wires up
+all Palace workbench objects for a 2-port driven S-parameter simulation.
+
+Geometry
+--------
+  Annular cylinder (air dielectric) cut from a solid cylinder:
+
+      |←————— 10 mm ——————→|
+      ┌──────────────────────┐  ← outer conductor (r = 3.50 mm) — PEC
+      │   ┌──────────────┐   │
+      │   │ inner cond.  │   │  inner conductor (r = 1.52 mm)  — PEC
+      │   │ (solid, cut) │   │
+      │   └──────────────┘   │
+      └──────────────────────┘
+      ↑ Port 1 (z=0)          ↑ Port 2 (z=10mm)
+        50 Ω, excited           50 Ω, passive
+
+  Z₀ = 60 · ln(3.50 / 1.52) ≈ 50.0 Ω  ✓  (air, εᵣ = 1)
+
+Port direction "+R": radial (from inner to outer conductor), required
+for coaxial geometry — Palace's CoaxialElementData uses E = ê_r/r.
+
+Expected Palace result (1–5 GHz driven sweep)
+---------------------------------------------
+  S11 ≈ −40 dB or better  (well-matched coaxial through)
+  S21 ≈   0 dB            (full transmission, lossless air coax)
+
+How to run
+----------
+  FreeCAD → Tools → Macros → … → select this file → Execute
+  Then use the Palace toolbar: "Generate & Run" to mesh and export.
+"""
+
+import sys
+import os
+import math
+
+import FreeCAD
+import FreeCADGui
+import Part
+
+# ---------------------------------------------------------------------------
+# Make sure the Palace workbench is importable
+# ---------------------------------------------------------------------------
+_WB_DIR = os.path.join(
+    os.path.expanduser("~"),
+    "AppData", "Roaming", "FreeCAD", "Mod", "PalaceWorkbench",
+)
+if _WB_DIR not in sys.path:
+    sys.path.insert(0, _WB_DIR)
+
+# ---------------------------------------------------------------------------
+# Coaxial parameters  —  50 Ω, air-filled, units in mm
+# ---------------------------------------------------------------------------
+LENGTH  = 10.0   # coax section length (mm)
+R_INNER =  1.52  # inner conductor outer radius (mm); Z0 = 60·ln(3.5/1.52) ≈ 50.0 Ω
+R_OUTER =  3.50  # outer conductor inner radius (mm)
+
+_z0 = 60.0 * math.log(R_OUTER / R_INNER)
+FreeCAD.Console.PrintMessage(
+    f"CoaxThru: Z₀ = {_z0:.1f} Ω  (inner={R_INNER} mm, outer={R_OUTER} mm)\n"
+)
+
+# ---------------------------------------------------------------------------
+# Document
+# ---------------------------------------------------------------------------
+doc = FreeCAD.ActiveDocument
+if doc is None:
+    doc = FreeCAD.newDocument("CoaxThru")
+else:
+    # Clear any previous Palace objects so this macro is re-runnable
+    to_remove = [
+        o for o in doc.Objects
+        if o.Label.startswith(("PalaceSimulation", "PalaceAirbox",
+                               "PalaceLumpedPort", "CoaxDomain"))
+    ]
+    for o in to_remove:
+        doc.removeObject(o.Name)
+    doc.recompute()
+
+# ---------------------------------------------------------------------------
+# Geometry — annular solid = simulation domain
+# ---------------------------------------------------------------------------
+outer_cyl    = Part.makeCylinder(R_OUTER, LENGTH)
+inner_cyl    = Part.makeCylinder(R_INNER, LENGTH)
+coax_shape   = outer_cyl.cut(inner_cyl)   # annular region (air dielectric)
+
+domain_obj         = doc.addObject("Part::Feature", "CoaxDomain")
+domain_obj.Shape   = coax_shape
+domain_obj.Label   = "CoaxDomain"
+doc.recompute()
+
+FreeCAD.Console.PrintMessage("CoaxThru: Annular coax geometry created.\n")
+
+# ---------------------------------------------------------------------------
+# Identify port faces  (the two flat annular end-caps)
+# ---------------------------------------------------------------------------
+def _find_flat_face_at_z(shape, z_target, tol=0.5):
+    """
+    Return the 1-based face index string of the first planar face whose
+    centre-of-mass z-coordinate is within *tol* mm of *z_target*.
+    """
+    for idx, face in enumerate(shape.Faces, start=1):
+        surface_type = type(face.Surface).__name__
+        if "Plane" in surface_type:
+            if abs(face.CenterOfMass.z - z_target) < tol:
+                return f"Face{idx}"
+    return None
+
+face_port1 = _find_flat_face_at_z(coax_shape, 0.0)
+face_port2 = _find_flat_face_at_z(coax_shape, LENGTH)
+
+if face_port1 is None or face_port2 is None:
+    FreeCAD.Console.PrintWarning(
+        "CoaxThru: Could not auto-detect port faces — defaulting to Face3 / Face4.\n"
+        "Open each LumpedPort task panel and re-assign the faces if needed.\n"
+    )
+    face_port1 = face_port1 or "Face3"
+    face_port2 = face_port2 or "Face4"
+
+FreeCAD.Console.PrintMessage(
+    f"CoaxThru: Port faces → Port 1 = {face_port1} (z=0),"
+    f"  Port 2 = {face_port2} (z={LENGTH} mm)\n"
+)
+
+# ---------------------------------------------------------------------------
+# Palace objects
+# ---------------------------------------------------------------------------
+from features.simulation  import create_simulation
+from features.airbox      import create_airbox
+from features.lumped_port import create_lumped_port
+
+# --- Simulation container (Driven, 1–5 GHz) ---------------------------------
+sim = create_simulation(doc)
+sim.SimulationType  = "Driven"
+sim.DrivenMinFreq   = 1e9    # stored in Hz; config.py converts to GHz for Palace
+sim.DrivenMaxFreq   = 5e9
+sim.DrivenFreqStep  = 1e9
+sim.L0              = 1e-3   # 1 length unit = 1 mm
+sim.Order           = 2      # second-order FEM
+sim.Verbose         = 1
+sim.OutputDir       = "output/"
+# sim.PalaceBinary  = r"/path/to/palace"   # set if Palace binary is not on PATH
+
+# --- Airbox — the annular domain; all non-port faces → PEC ------------------
+airbox = create_airbox(doc, shape_obj=domain_obj)
+airbox.OuterBoundaryType = "PEC"   # inner + outer conductor walls → PEC
+
+# --- Port 1 — input end (z = 0), excited, 50 Ω -----------------------------
+port1 = create_lumped_port(doc, index=1,
+                            faces=[(domain_obj, [face_port1])])
+port1.Direction  = "+R"   # radial: inner → outer conductor (coaxial TEM mode)
+port1.R          = 50.0   # Ω
+port1.Excitation = True
+
+# --- Port 2 — output end (z = LENGTH), passive 50 Ω termination -------------
+port2 = create_lumped_port(doc, index=2,
+                            faces=[(domain_obj, [face_port2])])
+port2.Direction  = "+R"
+port2.R          = 50.0
+port2.Excitation = False
+
+doc.recompute()
+
+# ---------------------------------------------------------------------------
+# Fit the 3D view
+# ---------------------------------------------------------------------------
+try:
+    FreeCADGui.ActiveDocument.ActiveView.fitAll()
+except Exception:
+    pass
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+FreeCAD.Console.PrintMessage(
+    "\n"
+    "══════════════════════════════════════════════════════════\n"
+    " CoaxThru Palace test setup complete\n"
+    "══════════════════════════════════════════════════════════\n"
+    f"  Geometry    : annular coax, L={LENGTH} mm, "
+    f"r_i={R_INNER} mm, r_o={R_OUTER} mm, Z₀≈{_z0:.0f} Ω\n"
+    f"  Simulation  : Driven, {sim.DrivenMinFreq/1e9:.1f}–"
+    f"{sim.DrivenMaxFreq/1e9:.1f} GHz, "
+    f"step {sim.DrivenFreqStep/1e9:.2f} GHz\n"
+    f"  FE order    : {sim.Order}\n"
+    f"  Port 1      : {face_port1}  (z=0 mm)     50 Ω  excited  dir=+R\n"
+    f"  Port 2      : {face_port2}  (z={LENGTH} mm)  50 Ω  passive dir=+R\n"
+    f"  Outer BC    : PEC (inner + outer conductor walls)\n"
+    "\n"
+    "  Next: switch to the Palace workbench and click\n"
+    "        'Generate & Run' to mesh and export the config.\n"
+    "\n"
+    "  Expected results:\n"
+    "        S11 ≈ −40 dB  (well-matched coaxial through)\n"
+    "        S21 ≈   0 dB  (full through-transmission)\n"
+    "══════════════════════════════════════════════════════════\n"
+)

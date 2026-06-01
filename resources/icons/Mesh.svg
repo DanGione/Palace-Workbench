@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Background circle -->
+  <circle cx="32" cy="32" r="30" fill="#1565C0"/>
+  <!-- Triangulated mesh face: three triangles sharing a centre point -->
+  <polygon points="16,46 32,18 32,46" fill="none" stroke="white" stroke-width="2.5" stroke-linejoin="round"/>
+  <polygon points="32,18 48,46 32,46" fill="none" stroke="white" stroke-width="2.5" stroke-linejoin="round"/>
+  <polygon points="16,46 48,46 32,18" fill="none" stroke="white" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- Mesh vertices -->
+  <circle cx="16" cy="46" r="3" fill="white"/>
+  <circle cx="32" cy="18" r="3" fill="white"/>
+  <circle cx="48" cy="46" r="3" fill="white"/>
+  <circle cx="32" cy="46" r="3" fill="white"/>
+</svg>

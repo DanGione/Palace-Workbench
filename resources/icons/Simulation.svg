@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Document body -->
+  <rect x="10" y="6" width="38" height="48" rx="3" fill="#E3F2FD" stroke="#1565C0" stroke-width="3"/>
+  <!-- Folded corner -->
+  <polyline points="36,6 48,18 36,18" fill="#BBDEFB" stroke="#1565C0" stroke-width="2"/>
+  <!-- Text lines -->
+  <line x1="17" y1="28" x2="41" y2="28" stroke="#1565C0" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="17" y1="36" x2="41" y2="36" stroke="#1565C0" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="17" y1="44" x2="32" y2="44" stroke="#1565C0" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- Gear overlay -->
+  <circle cx="48" cy="48" r="12" fill="#1565C0"/>
+  <circle cx="48" cy="48" r="5" fill="white"/>
+  <rect x="46" y="36" width="4" height="5" rx="1" fill="white"/>
+  <rect x="46" y="55" width="4" height="5" rx="1" fill="white"/>
+  <rect x="36" y="46" width="5" height="4" rx="1" fill="white"/>
+  <rect x="55" y="46" width="5" height="4" rx="1" fill="white"/>
+</svg>
