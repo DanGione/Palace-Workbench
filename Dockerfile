@@ -75,7 +75,9 @@ RUN printf '#!/bin/bash\nexport LIBGL_ALWAYS_SOFTWARE=1\nexec openbox-session\n'
     && chmod +x /home/${USERNAME}/.vnc/xstartup
 
 # Openbox autostart: launch FreeCAD automatically when the desktop starts
-RUN printf '#!/bin/bash\nfreecad &\n' \
+# QT_ENABLE_HIGHDPI_SCALING=0 disables Qt 5.14+ auto HiDPI scaling (QT_AUTO_SCREEN_SCALE_FACTOR
+# is ignored in Qt 5.14+ and QT_ENABLE_HIGHDPI_SCALING is the correct override).
+RUN printf '#!/bin/bash\nexport QT_AUTO_SCREEN_SCALE_FACTOR=0\nexport QT_SCALE_FACTOR=1\nexport QT_ENABLE_HIGHDPI_SCALING=0\nexport QT_FONT_DPI=96\nfreecad &\n' \
         > /home/${USERNAME}/.config/openbox/autostart \
     && chmod +x /home/${USERNAME}/.config/openbox/autostart
 

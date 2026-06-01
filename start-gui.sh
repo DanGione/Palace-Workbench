@@ -39,6 +39,8 @@ cat > ~/.vnc/xstartup << 'XSTARTUP'
 export LIBGL_ALWAYS_SOFTWARE=1
 export QT_AUTO_SCREEN_SCALE_FACTOR=0
 export QT_SCALE_FACTOR=1
+export QT_ENABLE_HIGHDPI_SCALING=0
+export QT_FONT_DPI=96
 export QT_X11_NO_MITSHM=1
 exec openbox-session
 XSTARTUP
