@@ -24,7 +24,8 @@
         "ms-python.python",
         "ms-python.vscode-pylance",
         "ms-python.debugpy",
-        "ms-toolsai.jupyter"
+        "ms-toolsai.jupyter",
+        "anthropic.claude-code"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/opt/conda/bin/python",

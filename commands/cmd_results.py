@@ -4,13 +4,12 @@ import os
 _ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "Results.svg")
 
 
-def _default_csv(doc):
+def _default_nc(doc):
     if doc and doc.FileName:
-        base = os.path.dirname(doc.FileName)
-    else:
-        import tempfile
-        base = tempfile.gettempdir()
-    return os.path.join(base, "palace_output", "output", "port-S.csv")
+        stem = os.path.splitext(os.path.basename(doc.FileName))[0]
+        return os.path.join(os.path.dirname(doc.FileName), stem, "results.nc")
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "palace_output", "results.nc")
 
 
 class CmdViewResults:
@@ -20,19 +19,19 @@ class CmdViewResults:
             "MenuText": "View S-Parameters",
             "ToolTip":  (
                 "Open the S-parameter plot viewer.  Loads the results from the "
-                "last simulation automatically; use 'Load CSV…' inside the panel "
-                "to open a different file."
+                "last simulation automatically; use 'Load…' inside the panel "
+                "to open a different results file."
             ),
         }
 
     def IsActive(self):
-        return True   # viewer can load any CSV regardless of document state
+        return True
 
     def Activated(self):
         from panels.s_param_panel import SParamPanel
         viewer = SParamPanel.get_or_create()
-        csv_path = _default_csv(FreeCAD.ActiveDocument)
-        if os.path.isfile(csv_path):
-            viewer.load_csv(csv_path)
+        nc_path = _default_nc(FreeCAD.ActiveDocument)
+        if os.path.isfile(nc_path):
+            viewer.load_nc(nc_path)
         else:
-            viewer.browse_csv()
+            viewer.browse_nc()

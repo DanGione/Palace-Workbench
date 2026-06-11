@@ -58,7 +58,7 @@ RUN conda install -y -c conda-forge --override-channels "freecad=1.0.0" \
     && conda clean -afy
 
 # ── gmsh (Python API + CLI) ──────────────────────────────────────────────────
-RUN pip install --no-cache-dir gmsh numpy scipy cmake matplotlib
+RUN pip install --no-cache-dir gmsh numpy scipy cmake matplotlib xarray netCDF4
 
 # ── Palace (AWSLabs) — latest source from GitHub ─────────────────────────────
 # Palace ships a CMake superbuild that downloads and compiles all of its own

@@ -67,9 +67,13 @@ def sync_port_group(port_obj):
         return
     doc = port_obj.Document
 
-    # Remove all previously managed children unconditionally.
+    # Remove managed binders (owned by this function) and detach stray objects
+    # without deleting them — stray objects belong to the user's document.
     for child in list(port_obj.Group):
-        doc.removeObject(child.Name)
+        if child.TypeId == _BINDER_TYPE:
+            doc.removeObject(child.Name)
+        else:
+            port_obj.removeObject(child)
 
     stray_added = set()   # deduplicate whole-object additions
 

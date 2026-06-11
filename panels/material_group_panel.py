@@ -102,11 +102,10 @@ class DielectricGroupPanel:
 
     def getStandardButtons(self):
         try:
-            from PySide2.QtWidgets import QDialogButtonBox
-            return int(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        except ImportError:
-            from PySide6.QtWidgets import QDialogButtonBox
-            return QDialogButtonBox.Ok.value | QDialogButtonBox.Cancel.value
+            return int(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        except TypeError:
+            return (QtWidgets.QDialogButtonBox.Ok.value
+                    | QtWidgets.QDialogButtonBox.Cancel.value)
 
 
 class ConductorGroupPanel:
@@ -226,8 +225,7 @@ class ConductorGroupPanel:
 
     def getStandardButtons(self):
         try:
-            from PySide2.QtWidgets import QDialogButtonBox
-            return int(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        except ImportError:
-            from PySide6.QtWidgets import QDialogButtonBox
-            return QDialogButtonBox.Ok.value | QDialogButtonBox.Cancel.value
+            return int(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        except TypeError:
+            return (QtWidgets.QDialogButtonBox.Ok.value
+                    | QtWidgets.QDialogButtonBox.Cancel.value)

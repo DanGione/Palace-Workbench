@@ -1,16 +1,11 @@
 """Dockable S-parameter plot viewer for the Palace workbench.
 
-Parses Palace port-S.csv output and displays magnitude (dB) and phase (°)
-vs frequency using an embedded matplotlib figure with the full navigation
-toolbar (zoom / pan / save-to-PNG).
-
-matplotlib is an optional dependency.  If it is not installed the panel
-shows installation instructions instead of crashing.
+Loads Palace results.nc (xarray/NetCDF4) and displays S-parameter magnitude
+(dB) and phase (°) vs frequency using an embedded matplotlib figure with the
+full navigation toolbar (zoom / pan / save-to-PNG).
 """
 
-import csv
 import os
-import re
 
 try:
     from PySide2 import QtCore, QtGui, QtWidgets
@@ -28,15 +23,9 @@ try:
 except Exception:
     _MPL_OK = False
 
-# ---------------------------------------------------------------------------
-# CSV parsing (regexes identical to palace/post_process.py)
-# ---------------------------------------------------------------------------
-_MAG_RE = re.compile(r"\|S\[(\d+)\]\[(\d+)\]\|")
-_ANG_RE = re.compile(r"arg\(S\[(\d+)\]\[(\d+)\]\)")
 
-
-def _parse_csv(path):
-    """Parse a Palace port-S.csv file.
+def _load_nc(path):
+    """Load S-parameter data from a Palace results.nc file.
 
     Returns
     -------
@@ -44,26 +33,26 @@ def _parse_csv(path):
     mag_db    : dict[(row, col) -> list[float]]
     phase_deg : dict[(row, col) -> list[float]]
     """
-    with open(path, newline="", encoding="utf-8") as fh:
-        reader = csv.reader(fh)
-        headers = [h.strip() for h in next(reader)]
-        rows = [[float(v) for v in r] for r in reader if any(v.strip() for v in r)]
+    import numpy as np
+    from palace.results_db import load_dataset
+    ds = load_dataset(path)
 
-    mag_cols   = {}   # (row, col) -> column index
-    phase_cols = {}
+    freq_ghz  = ds.coords["freq"].values.tolist()
+    port_i    = ds.coords["port_i"].values.tolist()
+    port_j    = ds.coords["port_j"].values.tolist()
+    mag_arr   = ds["S_mag_db"].values   # (freq, port_i, port_j)
+    phase_arr = ds["S_phase"].values
 
-    for i, h in enumerate(headers):
-        m = _MAG_RE.search(h)
-        if m:
-            mag_cols[(int(m.group(1)), int(m.group(2)))] = i
-            continue
-        m = _ANG_RE.search(h)
-        if m:
-            phase_cols[(int(m.group(1)), int(m.group(2)))] = i
+    mag_db    = {}
+    phase_deg = {}
+    for ri, r in enumerate(port_i):
+        for ci, c in enumerate(port_j):
+            col_mag = mag_arr[:, ri, ci]
+            if not np.all(np.isnan(col_mag)):
+                mag_db[(int(r), int(c))]    = col_mag.tolist()
+                phase_deg[(int(r), int(c))] = phase_arr[:, ri, ci].tolist()
 
-    freq_ghz  = [r[0] for r in rows]
-    mag_db    = {k: [r[v] for r in rows] for k, v in mag_cols.items()}
-    phase_deg = {k: [r[v] for r in rows] for k, v in phase_cols.items()}
+    ds.close()
     return freq_ghz, mag_db, phase_deg
 
 
@@ -121,8 +110,8 @@ class SParamPanel(QtWidgets.QDockWidget):
         self._mag    = {}   # (r,c) -> list[float]
         self._phase  = {}
         self._checks = {}   # (r,c) -> QCheckBox
-        self._checked_keys: set = set()   # persists across CSV reloads
-        self._csv_path: str | None = None
+        self._checked_keys: set = set()   # persists across reloads
+        self._nc_path: str | None = None
         self._s_renorm_mag: dict = {}
         self._s_renorm_phase: dict = {}
         self._renorm_active = False
@@ -137,9 +126,9 @@ class SParamPanel(QtWidgets.QDockWidget):
         self._file_label = QtWidgets.QLabel("(no file loaded)")
         self._file_label.setWordWrap(False)
         file_row.addWidget(self._file_label, 1)
-        btn_load = QtWidgets.QPushButton("Load CSV…")
-        btn_load.setFixedWidth(90)
-        btn_load.clicked.connect(self.browse_csv)
+        btn_load = QtWidgets.QPushButton("Load…")
+        btn_load.setFixedWidth(70)
+        btn_load.clicked.connect(self.browse_nc)
         file_row.addWidget(btn_load)
         vl.addLayout(file_row)
 
@@ -165,8 +154,8 @@ class SParamPanel(QtWidgets.QDockWidget):
         self._ctrl_row.addStretch()
         vl.addLayout(self._ctrl_row)
 
-        # --- renormalization button ---
-        renorm_row = QtWidgets.QHBoxLayout()
+        # --- action buttons row ---
+        action_row = QtWidgets.QHBoxLayout()
         self._btn_renorm = QtWidgets.QPushButton("Renormalize to Port Targets")
         self._btn_renorm.setToolTip(
             "Reads CharacteristicZ and RenormZ from each wave port in the active\n"
@@ -176,9 +165,17 @@ class SParamPanel(QtWidgets.QDockWidget):
         )
         self._btn_renorm.setEnabled(False)
         self._btn_renorm.clicked.connect(self._apply_renorm)
-        renorm_row.addWidget(self._btn_renorm)
-        renorm_row.addStretch()
-        vl.addLayout(renorm_row)
+        action_row.addWidget(self._btn_renorm)
+
+        self._btn_export_ts = QtWidgets.QPushButton("Export Touchstone…")
+        self._btn_export_ts.setToolTip(
+            "Export the current S-parameters as a Touchstone .sNp file."
+        )
+        self._btn_export_ts.setEnabled(False)
+        self._btn_export_ts.clicked.connect(self._export_touchstone)
+        action_row.addWidget(self._btn_export_ts)
+        action_row.addStretch()
+        vl.addLayout(action_row)
 
         # --- plot area ---
         if _MPL_OK:
@@ -210,18 +207,20 @@ class SParamPanel(QtWidgets.QDockWidget):
     # Public API
     # ------------------------------------------------------------------
 
-    def load_csv(self, path):
-        """Parse *path* and refresh the plot."""
+    def load_nc(self, path):
+        """Load a Palace results.nc file and refresh the plot."""
         if not _MPL_OK:
             return
         try:
-            self._freq, self._mag, self._phase = _parse_csv(path)
+            self._freq, self._mag, self._phase = _load_nc(path)
         except Exception as exc:
             import FreeCAD
-            FreeCAD.Console.PrintError(f"Palace S-param viewer: failed to load {path}: {exc}\n")
+            FreeCAD.Console.PrintError(
+                f"Palace S-param viewer: failed to load {path}: {exc}\n"
+            )
             return
 
-        self._csv_path = path
+        self._nc_path = path
         self._renorm_active = False
         self._s_renorm_mag = {}
         self._s_renorm_phase = {}
@@ -229,18 +228,20 @@ class SParamPanel(QtWidgets.QDockWidget):
         self._file_label.setText(os.path.basename(path))
         self._file_label.setToolTip(path)
         self._btn_renorm.setEnabled(True)
+        self._btn_export_ts.setEnabled(True)
 
         self._load_selection_from_doc()
         self._rebuild_checkboxes()
         self._refresh_plot()
 
-    def browse_csv(self):
-        """Open a file picker, then load the chosen CSV."""
+    def browse_nc(self):
+        """Open a file picker, then load the chosen results file."""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open Palace port-S.csv", "", "CSV files (*.csv);;All files (*)"
+            self, "Open Palace results file", "",
+            "Palace results (*.nc);;All files (*)"
         )
         if path:
-            self.load_csv(path)
+            self.load_nc(path)
 
     # ------------------------------------------------------------------
     # Internal
@@ -248,7 +249,7 @@ class SParamPanel(QtWidgets.QDockWidget):
 
     def _apply_renorm(self):
         """Renormalize to per-port targets read from the active FreeCAD document."""
-        if not self._csv_path:
+        if not self._mag:
             return
         try:
             import FreeCAD
@@ -270,10 +271,12 @@ class SParamPanel(QtWidgets.QDockWidget):
                 idx = lp.PortIndex
                 r   = getattr(lp, "R", 50.0)
                 port_z_old[idx] = r
-                port_z_new[idx] = r   # lumped ports: renorm to same R (identity)
+                port_z_new[idx] = r
 
-            from palace.post_process import renormalize_s_matrix
-            _, mag, phase = renormalize_s_matrix(self._csv_path, port_z_old, port_z_new)
+            from palace.post_process import renormalize_s_matrix_from_data
+            _, mag, phase = renormalize_s_matrix_from_data(
+                self._freq, self._mag, self._phase, port_z_old, port_z_new
+            )
             self._s_renorm_mag   = mag
             self._s_renorm_phase = phase
             self._renorm_active  = True
@@ -284,6 +287,62 @@ class SParamPanel(QtWidgets.QDockWidget):
                 FreeCAD.Console.PrintError(f"Palace: S-param renormalization failed: {exc}\n")
             except Exception:
                 pass
+
+    def _export_touchstone(self):
+        """Write S-parameters to a Touchstone .sNp file chosen by the user."""
+        if not self._mag or not self._freq:
+            return
+        n_ports = max(max(r, c) for r, c in self._mag)
+        default_name = f"port.s{n_ports}p"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Touchstone",
+            os.path.join(os.path.dirname(self._nc_path or ""), default_name)
+            if self._nc_path else default_name,
+            f"Touchstone (*.s{n_ports}p);;All files (*)",
+        )
+        if not path:
+            return
+
+        mag   = self._s_renorm_mag   if self._renorm_active else self._mag
+        phase = self._s_renorm_phase if self._renorm_active else self._phase
+
+        try:
+            import io, datetime
+            buf = io.StringIO()
+            buf.write("! Generated by Palace FreeCAD Workbench\n")
+            buf.write(f"! {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            buf.write("# GHz S DB R 50\n")
+            ordered = [
+                (row, col)
+                for col in range(1, n_ports + 1)
+                for row in range(1, n_ports + 1)
+                if (row, col) in mag
+            ]
+            for fi, f in enumerate(self._freq):
+                flat = []
+                for (r, c) in ordered:
+                    flat.append(mag[(r, c)][fi])
+                    flat.append(phase.get((r, c), [0.0] * len(self._freq))[fi])
+                VALUES_PER_LINE = 8
+                first = True
+                for i in range(0, len(flat), VALUES_PER_LINE):
+                    chunk = flat[i: i + VALUES_PER_LINE]
+                    nums = "  ".join(f"{v: .9e}" for v in chunk)
+                    if first:
+                        buf.write(f" {f:.9e}  {nums}\n")
+                        first = False
+                    else:
+                        buf.write(f"             {nums}\n")
+
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(buf.getvalue())
+
+            import FreeCAD
+            FreeCAD.Console.PrintMessage(f"Palace: Touchstone exported → {path}\n")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Export Failed", f"Could not write Touchstone file:\n{exc}"
+            )
 
     def _rebuild_checkboxes(self):
         """Recreate the S-param matrix of checkboxes from the current data keys."""

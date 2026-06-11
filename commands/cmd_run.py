@@ -3,6 +3,8 @@ import FreeCAD
 import FreeCADGui
 import json
 import os
+import shutil
+import tempfile
 import time
 
 try:
@@ -325,13 +327,19 @@ def _port_face_normal(port_obj):
 
 
 def _update_wave_port_impedances(doc, passes, out_dir):
-    """Extract Z_c from probe fields and store on each WavePort.CharacteristicZ."""
+    """Extract Z_c from probe fields and store on each WavePort.CharacteristicZ.
+
+    Returns {port_idx: list[complex]} — per-frequency Z0 for each wave port
+    where extraction succeeded.
+    """
+    import math
     from features import find_wave_ports
     from palace.post_process import parse_probe_csv, compute_wave_port_impedance
     from palace.config import _probe_points_along_edge, _probe_grid_over_port_face
 
     wave_ports = find_wave_ports(doc)
     updated = 0
+    z0_data = {}
 
     for wp in wave_ports:
         pts           = _probe_points_along_edge(wp)
@@ -395,7 +403,7 @@ def _update_wave_port_impedances(doc, passes, out_dir):
         if not z_c:
             continue
 
-        import math
+        z0_data[wp.PortIndex] = z_c
         z_c_mean = float(sum(abs(z) for z in z_c) / len(z_c))
         if math.isfinite(z_c_mean) and z_c_mean > 0:
             wp.CharacteristicZ = z_c_mean
@@ -407,12 +415,28 @@ def _update_wave_port_impedances(doc, passes, out_dir):
     if updated:
         doc.recompute()
 
+    return z0_data
+
 
 def _output_dir(doc):
     if doc.FileName:
-        return os.path.join(os.path.dirname(doc.FileName), "palace_output")
-    import tempfile
+        stem = os.path.splitext(os.path.basename(doc.FileName))[0]
+        return os.path.join(os.path.dirname(doc.FileName), stem)
     return os.path.join(tempfile.gettempdir(), "palace_output")
+
+
+def _update_mesh_object(doc, mesh_path):
+    """Update the PalaceMesh feature object and refresh its viewport display."""
+    from features.mesh import create_palace_mesh
+    mesh_obj = create_palace_mesh(doc)
+    mesh_obj.MeshFile = mesh_path
+    mesh_obj.Proxy.execute(mesh_obj)
+    doc.recompute()
+
+
+def _results_nc_path(doc):
+    """Return the path where results.nc is written (inside the named output folder)."""
+    return os.path.join(_output_dir(doc), "results.nc")
 
 
 def _find_excited_ports(doc):
@@ -443,50 +467,50 @@ def _clear_stale_csv(directory):
             pass
 
 
-def _build_passes(doc, out_dir):
+def _build_passes(doc, out_dir, tmp_dir):
     """Generate Palace config file(s) and return (passes, needs_merge).
 
     passes      : list of (config_path, pass_output_dir, port_index_or_None)
+                  pass_output_dir is under tmp_dir so Palace CSVs go there.
     needs_merge : True when more than one pass was built (S-matrix merge required)
 
-    All FreeCAD document access happens here, on the main thread, so the
-    background workers receive only plain file paths.
+    Config JSON files are written to out_dir (permanent); Palace output CSVs
+    go to tmp_dir subdirectories and are deleted after the dataset is built.
     """
     from palace.config import generate_config
 
     excited_ports = _find_excited_ports(doc)
 
     if len(excited_ports) <= 1:
-        pass_out_dir = os.path.join(out_dir, "output")
-        os.makedirs(pass_out_dir, exist_ok=True)
-        _clear_stale_csv(pass_out_dir)
+        tmp_pass_dir = os.path.join(tmp_dir, "output")
+        os.makedirs(tmp_pass_dir, exist_ok=True)
         config_path = os.path.join(out_dir, "palace_config.json")
-        cfg = generate_config(doc)
+        cfg = generate_config(doc, output_override=tmp_pass_dir + "/")
         with open(config_path, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, indent=2)
-        return [(config_path, pass_out_dir, None)], False
+        return [(config_path, tmp_pass_dir, None)], False
 
     # Multi-pass: one Palace run per excited port.
     passes = []
     for p in excited_ports:
-        pass_out_dir = os.path.join(out_dir, f"output_port{p.PortIndex}")
-        os.makedirs(pass_out_dir, exist_ok=True)
-        _clear_stale_csv(pass_out_dir)
+        tmp_pass_dir = os.path.join(tmp_dir, f"output_port{p.PortIndex}")
+        os.makedirs(tmp_pass_dir, exist_ok=True)
         config_path = os.path.join(out_dir, f"palace_config_port{p.PortIndex}.json")
         cfg = generate_config(
             doc,
             only_excitation=p.PortIndex,
-            output_override=pass_out_dir + "/",
+            output_override=tmp_pass_dir + "/",
         )
         with open(config_path, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, indent=2)
-        passes.append((config_path, pass_out_dir, p.PortIndex))
+        passes.append((config_path, tmp_pass_dir, p.PortIndex))
 
     return passes, True
 
 
 def _on_done(success, message, out_dir, passes, needs_merge,
-             console=None, t0=None, mesh_elapsed=None):
+             console=None, t0=None, mesh_elapsed=None, tmp_dir=None,
+             on_complete=None):
     """Called on the main thread when all passes have completed."""
     CmdRun._coordinator = None  # allow a new run to start
 
@@ -500,6 +524,8 @@ def _on_done(success, message, out_dir, passes, needs_merge,
             FreeCAD.Console.PrintError(f"Palace: {message}\n")
         if console is not None:
             console.set_status("Cancelled" if cancelled else f"Failed: {message}")
+        if tmp_dir and os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         if not cancelled:
             QtWidgets.QMessageBox.critical(None, "Palace Error", message)
         return
@@ -512,21 +538,24 @@ def _on_done(success, message, out_dir, passes, needs_merge,
     if sim_elapsed is not None:
         FreeCAD.Console.PrintMessage(f"Palace: Simulation time: {sim_elapsed}\n")
 
-    final_csv = os.path.join(out_dir, "output", "port-S.csv")
+    tmp_out = tmp_dir or out_dir
+    final_csv = os.path.join(tmp_out, "output", "port-S.csv")
 
     if needs_merge:
         if console is not None:
             console.write("[Post] Merging S-matrix…\n")
         try:
             from palace.post_process import merge_s_matrix
+            merged_dir = os.path.join(tmp_out, "output")
+            os.makedirs(merged_dir, exist_ok=True)
             pass_dirs = [d for _, d, _ in passes]
-            os.makedirs(os.path.dirname(final_csv), exist_ok=True)
             merge_s_matrix(pass_dirs, final_csv)
-            FreeCAD.Console.PrintMessage(f"Palace: Combined S-matrix → {final_csv}\n")
             if console is not None:
-                console.write(f"[Post] Combined S-matrix → {final_csv}\n")
+                console.write("[Post] S-matrix merged\n")
         except Exception as exc:
             FreeCAD.Console.PrintError(f"Palace: S-matrix merge failed: {exc}\n")
+            if tmp_dir and os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
             QtWidgets.QMessageBox.warning(
                 None,
                 "Palace Warning",
@@ -534,47 +563,103 @@ def _on_done(success, message, out_dir, passes, needs_merge,
             )
             return
 
-    # Extract characteristic impedance from field probes (wave ports with IntegrationEdge)
+    # Parse S-parameters from the temporary CSV
+    freq_ghz, s_mag_db, s_phase_deg = [], {}, {}
+    if os.path.isfile(final_csv):
+        try:
+            from palace.post_process import _parse_s_csv
+            freq_ghz, s_mag_db, s_phase_deg = _parse_s_csv(final_csv)
+        except Exception as exc:
+            FreeCAD.Console.PrintError(f"Palace: Failed to parse S-matrix: {exc}\n")
+
+    # Parse probe field CSVs from each pass directory in tmp
+    e_data_combined, b_data_combined = {}, {}
     try:
-        import FreeCAD as _FC
-        doc = _FC.ActiveDocument
+        from palace.post_process import parse_probe_csv
+        for _, pass_dir, _ in passes:
+            e_path = os.path.join(pass_dir, "probe-E.csv")
+            b_path = os.path.join(pass_dir, "probe-B.csv")
+            if os.path.isfile(e_path):
+                _, ed = parse_probe_csv(e_path)
+                e_data_combined.update(ed)
+            if os.path.isfile(b_path):
+                _, bd = parse_probe_csv(b_path)
+                b_data_combined.update(bd)
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(f"Palace: Could not parse probe CSVs: {exc}\n")
+
+    # Extract characteristic impedance (per frequency, per port)
+    z0_per_port = {}
+    try:
+        doc = FreeCAD.ActiveDocument
         if doc is not None:
-            _update_wave_port_impedances(doc, passes, out_dir)
+            z0_per_port = _update_wave_port_impedances(doc, passes, out_dir)
     except Exception as exc:
         FreeCAD.Console.PrintError(f"Palace: Z_c extraction failed: {exc}\n")
 
-    # Write Touchstone alongside the final CSV (single or multi-pass)
-    ts_path = None
-    if os.path.isfile(final_csv):
-        if console is not None:
-            console.write("[Post] Writing Touchstone…\n")
+    # Read config dict for metadata embedding
+    config_dict = None
+    first_cfg_path = passes[0][0] if passes else None
+    if first_cfg_path and os.path.isfile(first_cfg_path):
         try:
-            from palace.post_process import write_touchstone
-            ts_path = write_touchstone(final_csv)
-            FreeCAD.Console.PrintMessage(f"Palace: Touchstone file  → {ts_path}\n")
+            with open(first_cfg_path, encoding="utf-8") as fh:
+                config_dict = json.load(fh)
+        except Exception:
+            pass
+
+    # Build and save the results dataset
+    nc_path = None
+    if freq_ghz:
+        if console is not None:
+            console.write("[Post] Building results database…\n")
+        try:
+            from palace.results_db import build_dataset, save_dataset
+            doc = FreeCAD.ActiveDocument
+            nc_path = _results_nc_path(doc) if doc else os.path.join(out_dir, "results.nc")
+            ds = build_dataset(
+                freq_ghz, s_mag_db, s_phase_deg,
+                e_data=e_data_combined or None,
+                b_data=b_data_combined or None,
+                z0_per_port_per_freq=z0_per_port or None,
+                config_dict=config_dict,
+                metadata={
+                    "sim_elapsed":  sim_elapsed or "",
+                    "mesh_elapsed": mesh_elapsed or "",
+                },
+            )
+            save_dataset(ds, nc_path)
+            FreeCAD.Console.PrintMessage(f"Palace: Results database → {nc_path}\n")
             if console is not None:
-                console.write(f"[Done] Output: {ts_path}\n")
+                console.write(f"[Done] Results database → {nc_path}\n")
         except Exception as exc:
-            FreeCAD.Console.PrintError(f"Palace: Touchstone write failed: {exc}\n")
+            FreeCAD.Console.PrintError(f"Palace: Failed to save results database: {exc}\n")
+            nc_path = None
+
+    # Delete temporary Palace output directory
+    if tmp_dir and os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     if console is not None:
         console.set_status(f"Done ({sim_elapsed})" if sim_elapsed else "Done")
 
-    # Auto-open the S-parameter viewer
-    try:
-        from panels.s_param_panel import SParamPanel
-        viewer = SParamPanel.get_or_create()
-        viewer.load_csv(final_csv)
-    except Exception:
-        pass
+    if on_complete is not None:
+        on_complete(True, nc_path)
+        return
 
-    detail = f"S-matrix CSV:   {final_csv}"
-    if ts_path:
-        detail += f"\nTouchstone:     {ts_path}"
+    # Auto-open the S-parameter viewer
+    if nc_path and os.path.isfile(nc_path):
+        try:
+            from panels.s_param_panel import SParamPanel
+            viewer = SParamPanel.get_or_create()
+            viewer.load_nc(nc_path)
+        except Exception:
+            pass
+
+    detail = f"Results database: {nc_path}" if nc_path else "(no results file)"
     if mesh_elapsed:
-        detail += f"\nMesh time:       {mesh_elapsed}"
+        detail += f"\nMesh time:        {mesh_elapsed}"
     if sim_elapsed:
-        detail += f"\nSimulation time: {sim_elapsed}"
+        detail += f"\nSimulation time:  {sim_elapsed}"
     QtWidgets.QMessageBox.information(None, "Palace Complete", f"{message}\n\n{detail}")
 
 
@@ -594,7 +679,8 @@ def _find_mesh_file(doc):
 
 
 def _launch_passes(passes, needs_merge, out_dir, console, sim, binary,
-                   num_procs, num_threads, t0_sim, mesh_elapsed=None):
+                   num_procs, num_threads, t0_sim, mesh_elapsed=None, tmp_dir=None,
+                   on_complete=None, initial_status="Running Palace…"):
     """Create _PassWorker objects, set up console tabs, and start the coordinator.
 
     Must be called on the main thread.  Sets CmdRun._coordinator.
@@ -619,7 +705,7 @@ def _launch_passes(passes, needs_merge, out_dir, console, sim, binary,
         console.write(
             f"[Palace] Starting {n} pass{'es' if n > 1 else ''} ({mode_str})…\n"
         )
-        console.set_status("Running Palace…")
+        console.set_status(initial_status)
 
     # Create workers
     workers = []
@@ -634,7 +720,8 @@ def _launch_passes(passes, needs_merge, out_dir, console, sim, binary,
     coordinator = _SimCoordinator(workers, parallel, passes, labels, console)
     coordinator.all_done.connect(
         lambda ok, msg: _on_done(
-            ok, msg, out_dir, passes, needs_merge, console, t0_sim, mesh_elapsed
+            ok, msg, out_dir, passes, needs_merge, console, t0_sim, mesh_elapsed, tmp_dir,
+            on_complete=on_complete,
         )
     )
     coordinator.start_all()
@@ -732,14 +819,16 @@ class CmdRunOnly:
             if console is not None:
                 console.write(msg)
 
+        tmp_dir = tempfile.mkdtemp(prefix="palace_")
         try:
             _log(f"Palace: Using existing mesh: {mesh_path}\n")
-            passes, needs_merge = _build_passes(doc, out_dir)
+            passes, needs_merge = _build_passes(doc, out_dir, tmp_dir)
             n = len(passes)
             _log(f"Palace: {n} excitation pass{'es' if n > 1 else ''} prepared.\n")
 
             binary = sim.PalaceBinary if sim else ""
             if not binary or not os.path.isfile(binary):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
                 if console is not None:
                     console.set_status("No binary configured")
                 QtWidgets.QMessageBox.information(
@@ -751,6 +840,7 @@ class CmdRunOnly:
                 return
 
             if CmdRun._coordinator is not None and CmdRun._coordinator.is_running():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
                 QtWidgets.QMessageBox.warning(
                     None, "Palace Running",
                     "A simulation is already running.\n"
@@ -762,9 +852,10 @@ class CmdRunOnly:
             num_threads = int(getattr(sim, "NumThreads",   0)) if sim else 0
             t0_sim = time.time()
             _launch_passes(passes, needs_merge, out_dir, console, sim,
-                           binary, num_procs, num_threads, t0_sim)
+                           binary, num_procs, num_threads, t0_sim, tmp_dir=tmp_dir)
 
         except Exception as exc:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
             FreeCAD.Console.PrintError(f"Palace: {exc}\n")
             if console is not None:
                 console.write(f"ERROR: {exc}\n")
@@ -800,6 +891,8 @@ class CmdRun:
         out_dir = _output_dir(doc)
         os.makedirs(out_dir, exist_ok=True)
         sim = next((o for o in doc.Objects if hasattr(o, "SimulationType")), None)
+        if sim:
+            sim.OutputDir = out_dir
 
         console = None
         try:
@@ -815,34 +908,35 @@ class CmdRun:
             if console is not None:
                 console.write(msg)
 
+        def _mesh_log(msg):
+            FreeCAD.Console.PrintMessage(msg if msg.endswith("\n") else msg + "\n")
+
+        tmp_dir = tempfile.mkdtemp(prefix="palace_")
         try:
             # Step 1 — mesh (synchronous)
             _log("Palace: Generating mesh…\n")
             from palace.meshing import generate_mesh
             t0_mesh = time.time()
-            mesh_path = generate_mesh(doc, out_dir, log_fn=_log)
+            mesh_path = generate_mesh(doc, out_dir, log_fn=_mesh_log)
             mesh_elapsed = _fmt_elapsed(time.time() - t0_mesh)
             sim.MeshFile = mesh_path
             try:
-                from features.mesh import create_palace_mesh
-                mesh_obj = create_palace_mesh(doc)
-                mesh_obj.MeshFile = mesh_path
-                mesh_obj.Proxy.execute(mesh_obj)
-                doc.recompute()
-            except Exception:
-                pass
+                _update_mesh_object(doc, mesh_path)
+            except Exception as exc:
+                FreeCAD.Console.PrintWarning(f"Palace: mesh display update failed: {exc}\n")
             _log(f"Palace: Mesh written to {mesh_path}\n")
             _log(f"Palace: Mesh generated in {mesh_elapsed}\n")
 
             # Step 2 — build config(s) on the main thread
             _log("Palace: Writing config(s)…\n")
-            passes, needs_merge = _build_passes(doc, out_dir)
+            passes, needs_merge = _build_passes(doc, out_dir, tmp_dir)
             n = len(passes)
             _log(f"Palace: {n} excitation pass{'es' if n > 1 else ''} prepared.\n")
 
             # Step 3 — launch Palace (or inform user if binary not set)
             binary = sim.PalaceBinary if sim else ""
             if not binary or not os.path.isfile(binary):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
                 if console is not None:
                     console.set_status("No binary configured")
                 QtWidgets.QMessageBox.information(
@@ -854,6 +948,7 @@ class CmdRun:
                 return
 
             if CmdRun._coordinator is not None and CmdRun._coordinator.is_running():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
                 QtWidgets.QMessageBox.warning(
                     None,
                     "Palace Running",
@@ -866,9 +961,11 @@ class CmdRun:
             num_threads = int(getattr(sim, "NumThreads",   0)) if sim else 0
             t0_sim = time.time()
             _launch_passes(passes, needs_merge, out_dir, console, sim,
-                           binary, num_procs, num_threads, t0_sim, mesh_elapsed)
+                           binary, num_procs, num_threads, t0_sim, mesh_elapsed,
+                           tmp_dir=tmp_dir)
 
         except Exception as exc:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
             FreeCAD.Console.PrintError(f"Palace: {exc}\n")
             if console is not None:
                 console.write(f"ERROR: {exc}\n")

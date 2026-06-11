@@ -42,6 +42,18 @@ To stop: `Ctrl+C` in the terminal, or `docker compose down`.
 7. Click **Generate & Run** to mesh and solve.
 8. Results open automatically in the built-in S-parameter viewer.
 
+## Documentation
+
+| Guide | Description |
+|---|---|
+| [Getting Started](docs/getting-started.md) | End-to-end first simulation walkthrough |
+| [Geometry Guide](docs/geometry-guide.md) | Preparing geometry, materials, and VarSets |
+| [Ports Reference](docs/ports-reference.md) | Lumped Port, Wave Port, Impedance Boundary |
+| [Simulation Reference](docs/simulation-reference.md) | Simulation, Airbox, and Mesh settings |
+| [Results & Export](docs/results-and-export.md) | S-parameter viewer, sweep results, Touchstone |
+| [Sweep & Optimization](docs/sweep-and-optimization.md) | Parameter sweeps and geometry optimization |
+| [Troubleshooting](docs/troubleshooting.md) | Common issues and fixes |
+
 ## Example Files
 
 Three worked examples are included in the repository under the `projects/` folder:

@@ -235,29 +235,8 @@ def _parse_s_csv(path):
     return freq_ghz, mag_db, phase_deg
 
 
-def renormalize_s_matrix(s_csv_path, port_z_old, port_z_new):
-    """Renormalize S-matrix from per-port reference impedances to new target impedances.
-
-    Applies the power-wave bilinear S→Z→S transform:
-        Z_mat  = D_old @ (I + S) @ inv(I - S) @ D_old
-        S_new  = D_new⁻¹ @ (Z_mat - T_new) @ inv(Z_mat + T_new) @ D_new
-    where D_old = diag(sqrt(Z_old)), T_new = diag(Z_new).
-
-    Parameters
-    ----------
-    s_csv_path : path to Palace port-S.csv
-    port_z_old : {port_idx: float} — reference impedances S-params were computed at
-    port_z_new : {port_idx: float} — target normalization impedances
-    Ports absent from either dict default to 50 Ω.
-
-    Returns (freq_ghz, renorm_mag_db, renorm_phase_deg) with the same dict-of-lists
-    structure as _parse_s_csv, ready for the S-param viewer.
-    """
-    if not _NP_OK:
-        raise ImportError("numpy is required for S-parameter renormalization")
-
-    freq_ghz, mag_db, phase_deg = _parse_s_csv(s_csv_path)
-
+def _renormalize_data(freq_ghz, mag_db, phase_deg, port_z_old, port_z_new):
+    """Inner renormalization logic (operates on in-memory arrays)."""
     keys      = sorted(mag_db)
     all_ports = sorted(set(r for r, c in keys) | set(c for r, c in keys))
     n_ports   = len(all_ports)
@@ -292,6 +271,41 @@ def renormalize_s_matrix(s_csv_path, port_z_old, port_z_new):
             s_new_phase[(r, c)].append(float(_np.rad2deg(_np.angle(val))))
 
     return freq_ghz, s_new_mag, s_new_phase
+
+
+def renormalize_s_matrix(s_csv_path, port_z_old, port_z_new):
+    """Renormalize S-matrix from per-port reference impedances to new target impedances.
+
+    Applies the power-wave bilinear S→Z→S transform:
+        Z_mat  = D_old @ (I + S) @ inv(I - S) @ D_old
+        S_new  = D_new⁻¹ @ (Z_mat - T_new) @ inv(Z_mat + T_new) @ D_new
+    where D_old = diag(sqrt(Z_old)), T_new = diag(Z_new).
+
+    Parameters
+    ----------
+    s_csv_path : path to Palace port-S.csv
+    port_z_old : {port_idx: float} — reference impedances S-params were computed at
+    port_z_new : {port_idx: float} — target normalization impedances
+    Ports absent from either dict default to 50 Ω.
+
+    Returns (freq_ghz, renorm_mag_db, renorm_phase_deg) with the same dict-of-lists
+    structure as _parse_s_csv, ready for the S-param viewer.
+    """
+    if not _NP_OK:
+        raise ImportError("numpy is required for S-parameter renormalization")
+    freq_ghz, mag_db, phase_deg = _parse_s_csv(s_csv_path)
+    return _renormalize_data(freq_ghz, mag_db, phase_deg, port_z_old, port_z_new)
+
+
+def renormalize_s_matrix_from_data(freq_ghz, mag_db, phase_deg, port_z_old, port_z_new):
+    """Renormalize S-matrix from in-memory arrays (no CSV read).
+
+    Same transform and return format as renormalize_s_matrix, but accepts
+    already-parsed data directly (e.g. loaded from a results .nc file).
+    """
+    if not _NP_OK:
+        raise ImportError("numpy is required for S-parameter renormalization")
+    return _renormalize_data(freq_ghz, mag_db, phase_deg, port_z_old, port_z_new)
 
 
 def merge_s_matrix(pass_output_dirs, output_path):

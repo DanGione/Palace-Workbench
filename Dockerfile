@@ -43,7 +43,7 @@ RUN conda install -y -c conda-forge --override-channels "freecad=1.0.0" \
     && conda clean -afy
 
 # ── Python deps pre-installed into FreeCAD's conda environment ──────────────
-RUN pip install --no-cache-dir gmsh numpy scipy cmake matplotlib
+RUN pip install --no-cache-dir gmsh numpy scipy cmake matplotlib xarray netCDF4
 
 # ── Palace (AWSLabs) — builds all dependencies via CMake superbuild ──────────
 RUN git clone --depth=1 https://github.com/awslabs/palace.git /tmp/palace-src \

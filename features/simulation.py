@@ -52,6 +52,9 @@ class SimulationContainer:
              "Path to the generated Gmsh mesh file (set automatically)", "")
         _add(obj, "App::PropertyString", "SParamSelection", "Palace",
              "JSON list of [row,col] S-parameter keys selected in the viewer", "")
+        _add(obj, "App::PropertyString", "AvailableSParams", "Palace",
+             "JSON list of [[row,col],...] S-param pairs available given current port Excitation "
+             "settings (auto-updated on recompute).", "[]")
 
         # Mesh sizing
         _add(obj, "App::PropertyFloat", "MeshCharacteristicLengthMax", "Mesh",
@@ -97,7 +100,13 @@ class SimulationContainer:
              "Solver tolerance", 1e-8)
 
     def execute(self, obj):
-        pass
+        import json
+        try:
+            from features import get_available_s_params
+            pairs = get_available_s_params(obj.Document)
+            obj.AvailableSParams = json.dumps([[r, c] for r, c in pairs])
+        except Exception:
+            pass
 
     def onChanged(self, obj, prop):
         pass
