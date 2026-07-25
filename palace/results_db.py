@@ -175,7 +175,7 @@ def load_dataset(path):
     return ds
 
 
-def append_sweep_point(base_nc, ds_new, sweep_coord_name, sweep_coord_value):
+def append_sweep_point(base_nc, ds_new, sweep_coord_name, sweep_coord_value, extra_attrs=None):
     """Append a new simulation result along a named sweep dimension.
 
     If *base_nc* does not yet exist the new dataset is written directly.
@@ -188,6 +188,10 @@ def append_sweep_point(base_nc, ds_new, sweep_coord_name, sweep_coord_value):
     ds_new             : xr.Dataset — result of a single simulation run
     sweep_coord_name   : str — dimension name, e.g. "substrate_er"
     sweep_coord_value  : scalar — coordinate value for this run
+    extra_attrs        : dict or None — merged into the combined dataset's
+                         attrs before the single write, so callers annotating
+                         each sweep point (e.g. per-run params/objective) don't
+                         need a second full read-modify-rewrite pass.
     """
     _require_xarray()
     base_nc = Path(base_nc)
@@ -204,5 +208,8 @@ def append_sweep_point(base_nc, ds_new, sweep_coord_name, sweep_coord_value):
         ds_existing.close()
     else:
         ds_combined = ds_new
+
+    if extra_attrs:
+        ds_combined.attrs.update(extra_attrs)
 
     save_dataset(ds_combined, base_nc)

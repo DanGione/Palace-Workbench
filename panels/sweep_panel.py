@@ -182,6 +182,7 @@ class _ParamTableWidget(QtWidgets.QTableWidget):
 
         prop_combo = QtWidgets.QComboBox()
         prop_combo.setEditable(True)
+        prop_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
         if varset and self._doc:
             prop_combo.addItems([""] + _numeric_props(self._doc, varset))
         prop_combo.setCurrentText(prop)
@@ -212,6 +213,7 @@ class _ParamTableWidget(QtWidgets.QTableWidget):
         prop_combo.clear()
         prop_combo.addItems([""] + _numeric_props(self._doc, varset_text))
         prop_combo.setCurrentText(current)
+        self.resizeColumnToContents(_COL_PROP)
 
     def _on_property_changed(self, row, prop_text):
         if self._mode != "Optimize" or not self._doc or not prop_text:

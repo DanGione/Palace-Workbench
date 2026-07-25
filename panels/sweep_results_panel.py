@@ -164,18 +164,13 @@ class SweepResultsPanel(QtWidgets.QDockWidget):
 
         # --- File row ---
         file_row = QtWidgets.QHBoxLayout()
-        self._file_label = QtWidgets.QLabel("(no file loaded)")
+        self._file_label = QtWidgets.QLabel("(no results available)")
         self._file_label.setWordWrap(False)
         file_row.addWidget(self._file_label, 1)
-        btn_load = QtWidgets.QPushButton("Load…")
-        btn_load.setFixedWidth(70)
-        btn_load.clicked.connect(self.browse_nc)
-        file_row.addWidget(btn_load)
         self._btn_reload = QtWidgets.QPushButton("Reload")
         self._btn_reload.setFixedWidth(70)
-        self._btn_reload.setEnabled(False)
-        self._btn_reload.setToolTip("Re-read the current file from disk")
-        self._btn_reload.clicked.connect(self.reload_nc)
+        self._btn_reload.setToolTip("Re-check the active document for updated results.")
+        self._btn_reload.clicked.connect(self.refresh_from_active_document)
         file_row.addWidget(self._btn_reload)
         vl.addLayout(file_row)
 
@@ -184,6 +179,7 @@ class SweepResultsPanel(QtWidgets.QDockWidget):
         sweep_row.addWidget(QtWidgets.QLabel("Sweep point:"))
         self._combo_sweep = QtWidgets.QComboBox()
         self._combo_sweep.setMinimumWidth(120)
+        self._combo_sweep.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
         self._combo_sweep.currentIndexChanged.connect(self._refresh_plot)
         sweep_row.addWidget(self._combo_sweep)
         self._chk_overlay = QtWidgets.QCheckBox("Overlay all")
@@ -244,7 +240,7 @@ class SweepResultsPanel(QtWidgets.QDockWidget):
             vl.addWidget(placeholder, 1)
 
         self.setWidget(central)
-        parent.addDockWidget(Qt.BottomDockWidgetArea, self)
+        parent.addDockWidget(Qt.RightDockWidgetArea, self)
         self.show()
 
         try:
@@ -253,9 +249,55 @@ class SweepResultsPanel(QtWidgets.QDockWidget):
         except Exception:
             pass
 
+        try:
+            from commands.doc_events import doc_emitter
+            doc_emitter.active_document_changed.connect(
+                lambda: QtCore.QTimer.singleShot(0, self.refresh_from_active_document)
+            )
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def refresh_from_active_document(self):
+        """Resolve the embedded sweep results file from the active document and
+        load it, or show the empty state if none is embedded."""
+        if not _MPL_OK:
+            return
+        import FreeCAD
+        from palace.embedded_files import resolve
+        from features import find_sweep
+        doc = FreeCAD.ActiveDocument
+        sweep_obj = find_sweep(doc) if doc else None
+        nc_path = resolve(sweep_obj, "SweepResultsFile") if sweep_obj else ""
+        if nc_path and os.path.isfile(nc_path):
+            self.load_nc(nc_path)
+        else:
+            self._show_no_data("No sweep results embedded in the active document.")
+
+    def _show_no_data(self, message):
+        """Clear the plot and show an explanatory message in place of data."""
+        self._nc_path = None
+        self._sweep_dim = None
+        self._sweep_vals = []
+        self._freq_ghz = []
+        self._slices = {}
+        self._run_params = {}
+        self._obj_by_val = {}
+        self._file_label.setText("(no results available)")
+        self._file_label.setToolTip("")
+        self._combo_sweep.blockSignals(True)
+        self._combo_sweep.clear()
+        self._combo_sweep.blockSignals(False)
+        self._params_label.setText("")
+        self._rebuild_checkboxes()
+        if _MPL_OK:
+            self._ax.cla()
+            self._ax.text(0.5, 0.5, message, ha="center", va="center",
+                           transform=self._ax.transAxes, wrap=True, color="gray")
+            self._canvas.draw()
 
     def load_nc(self, path):
         """Load a Palace sweep.nc file and refresh the panel."""
@@ -269,10 +311,10 @@ class SweepResultsPanel(QtWidgets.QDockWidget):
             FreeCAD.Console.PrintError(
                 f"Palace sweep viewer: failed to load {path}: {exc}\n"
             )
+            self._show_no_data(f"Failed to load embedded results:\n{exc}")
             return
 
         self._nc_path = path
-        self._btn_reload.setEnabled(True)
         self._file_label.setText(os.path.basename(path))
         self._file_label.setToolTip(path)
 
@@ -296,19 +338,6 @@ class SweepResultsPanel(QtWidgets.QDockWidget):
 
         self._rebuild_checkboxes()
         self._refresh_plot()
-
-    def reload_nc(self):
-        """Re-read the currently loaded file from disk."""
-        if self._nc_path:
-            self.load_nc(self._nc_path)
-
-    def browse_nc(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open Palace sweep results file", "",
-            "Palace results (*.nc);;All files (*)"
-        )
-        if path:
-            self.load_nc(path)
 
     def _on_iteration_done(self, sweep_nc):
         """Called after each sweep/optimization iteration writes to the database."""

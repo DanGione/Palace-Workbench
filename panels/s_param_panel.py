@@ -123,13 +123,14 @@ class SParamPanel(QtWidgets.QDockWidget):
 
         # --- file row ---
         file_row = QtWidgets.QHBoxLayout()
-        self._file_label = QtWidgets.QLabel("(no file loaded)")
+        self._file_label = QtWidgets.QLabel("(no results available)")
         self._file_label.setWordWrap(False)
         file_row.addWidget(self._file_label, 1)
-        btn_load = QtWidgets.QPushButton("Load…")
-        btn_load.setFixedWidth(70)
-        btn_load.clicked.connect(self.browse_nc)
-        file_row.addWidget(btn_load)
+        self._btn_reload = QtWidgets.QPushButton("Reload")
+        self._btn_reload.setFixedWidth(70)
+        self._btn_reload.setToolTip("Re-check the active document for updated results.")
+        self._btn_reload.clicked.connect(self.refresh_from_active_document)
+        file_row.addWidget(self._btn_reload)
         vl.addLayout(file_row)
 
         # --- control row: checkboxes + mode radios ---
@@ -200,12 +201,53 @@ class SParamPanel(QtWidgets.QDockWidget):
             vl.addWidget(placeholder, 1)
 
         self.setWidget(central)
-        parent.addDockWidget(Qt.BottomDockWidgetArea, self)
+        parent.addDockWidget(Qt.RightDockWidgetArea, self)
         self.show()
+
+        try:
+            from commands.doc_events import doc_emitter
+            doc_emitter.active_document_changed.connect(
+                lambda: QtCore.QTimer.singleShot(0, self.refresh_from_active_document)
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def refresh_from_active_document(self):
+        """Resolve the embedded results file from the active document and load
+        it, or show the empty state if none is embedded."""
+        if not _MPL_OK:
+            return
+        import FreeCAD
+        from palace.embedded_files import resolve
+        from features import find_simulation
+        doc = FreeCAD.ActiveDocument
+        sim = find_simulation(doc) if doc else None
+        nc_path = resolve(sim, "ResultsFile") if sim else ""
+        if nc_path and os.path.isfile(nc_path):
+            self.load_nc(nc_path)
+        else:
+            self._show_no_data("No S-parameter results embedded in the active document.")
+
+    def _show_no_data(self, message):
+        """Clear the plot and show an explanatory message in place of data."""
+        self._nc_path = None
+        self._freq, self._mag, self._phase = [], {}, {}
+        self._renorm_active = False
+        self._s_renorm_mag, self._s_renorm_phase = {}, {}
+        self._file_label.setText("(no results available)")
+        self._file_label.setToolTip("")
+        self._btn_renorm.setEnabled(False)
+        self._btn_export_ts.setEnabled(False)
+        self._rebuild_checkboxes()
+        if _MPL_OK:
+            self._ax.cla()
+            self._ax.text(0.5, 0.5, message, ha="center", va="center",
+                           transform=self._ax.transAxes, wrap=True, color="gray")
+            self._canvas.draw()
 
     def load_nc(self, path):
         """Load a Palace results.nc file and refresh the plot."""
@@ -218,6 +260,7 @@ class SParamPanel(QtWidgets.QDockWidget):
             FreeCAD.Console.PrintError(
                 f"Palace S-param viewer: failed to load {path}: {exc}\n"
             )
+            self._show_no_data(f"Failed to load embedded results:\n{exc}")
             return
 
         self._nc_path = path
@@ -233,15 +276,6 @@ class SParamPanel(QtWidgets.QDockWidget):
         self._load_selection_from_doc()
         self._rebuild_checkboxes()
         self._refresh_plot()
-
-    def browse_nc(self):
-        """Open a file picker, then load the chosen results file."""
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open Palace results file", "",
-            "Palace results (*.nc);;All files (*)"
-        )
-        if path:
-            self.load_nc(path)
 
     # ------------------------------------------------------------------
     # Internal
@@ -294,10 +328,18 @@ class SParamPanel(QtWidgets.QDockWidget):
             return
         n_ports = max(max(r, c) for r, c in self._mag)
         default_name = f"port.s{n_ports}p"
+        # Default to the project's own folder, not self._nc_path's directory --
+        # since results.nc is now embedded in the .FCStd, that path resolves to
+        # a private FreeCAD cache directory rather than anywhere user-visible.
+        import FreeCAD
+        doc = FreeCAD.ActiveDocument
+        default_dir = (
+            os.path.dirname(doc.FileName) if doc and doc.FileName
+            else os.path.expanduser("~")
+        )
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export Touchstone",
-            os.path.join(os.path.dirname(self._nc_path or ""), default_name)
-            if self._nc_path else default_name,
+            os.path.join(default_dir, default_name),
             f"Touchstone (*.s{n_ports}p);;All files (*)",
         )
         if not path:

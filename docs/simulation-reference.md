@@ -18,7 +18,7 @@ Double-click the **PalaceSimulation** object to open this panel. It has three ta
 | **MPI processes** | Number of parallel MPI ranks. On a 4-core machine, 2–4 is typical. More ranks reduces wall-clock time but increases memory. |
 | **OMP threads/rank** | OpenMP threads per MPI rank. 0 = let the system decide. If MPI processes × OMP threads exceeds your core count, you'll see diminishing returns. |
 | **Length scale L0 (m)** | Converts model units to metres. Use `1e-3` if your model is drawn in millimetres (the typical FreeCAD default). All frequency-independent lengths (Airbox size, port geometry) are multiplied by L0 internally. |
-| **Output directory** | Where Palace writes its CSV and field output files. Defaults to a subfolder named after your `.FCStd` file. |
+| **Output directory** | Legacy field, no longer used — Palace's raw CSV/field output is written to a temporary scratch location and discarded once the results database is built and embedded in the `.FCStd`. Safe to leave at its default. |
 | **Palace binary** | Full path to the `palace` executable. Pre-configured in the Docker image. For native installs, point this to your compiled binary. |
 
 **Mesh group (also on General tab):**
@@ -137,6 +137,28 @@ All sizes are in model units (mm if L0 = 1e-3).
 | Max element size | 2.0 |
 | Conductor size | 0.2 |
 | Port size | 0.3 |
+
+### Mesh quality check
+
+After every mesh generation, Palace checks the quality of the generated tetrahedra
+(Gmsh's `minSICN` measure — 1.0 is equilateral, 0 is degenerate, negative is inverted)
+and logs a pass/warn line to the FreeCAD Report View and the Palace debug console. If
+any elements fall below the threshold:
+
+- **Single "Generate Mesh" or "Generate && Run":** you're asked whether to proceed
+  before the mesh is kept/the simulation launches.
+- **Sweeps and optimizations:** only the **first** meshing pass asks; if the mesh
+  degrades on a later iteration it's just logged, and the run's "Sweep Complete"/"Sweep
+  Failed" summary notes how many iterations were affected.
+
+The threshold is **Quality warn threshold** (`MeshQualityWarnThreshold`, default
+`0.1`), a property on the **PalaceMesh** object — there's no dedicated field for it in
+this panel yet, so set it from the **Data** tab in the Property Editor (group
+"Refinement", alongside Conductor size/Port size/Refine distance). `0` disables the
+check entirely.
+
+See [Troubleshooting → Mesh generation](troubleshooting.md#mesh-generation) for what
+usually causes a low-quality mesh and how to fix it.
 
 ### Mesh Status group
 

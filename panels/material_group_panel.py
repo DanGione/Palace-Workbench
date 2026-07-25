@@ -88,7 +88,19 @@ class DielectricGroupPanel:
 
     def accept(self):
         o = self.obj
-        o.MaterialName = self.edit_name.text().strip()
+        name = self.edit_name.text().strip()
+        if name:
+            from features.material_group import find_group_label_collision
+            collision = find_group_label_collision(o.Document, o, name)
+            if collision:
+                QtWidgets.QMessageBox.warning(
+                    self.form, "Name Already Used",
+                    f"Another group is already named '{name}'. Choose a "
+                    f"different Material Name."
+                )
+                return False
+            o.Label = name
+        o.MaterialName = name
         o.Permittivity = self._float(self.edit_eps, o.Permittivity)
         o.Permeability = self._float(self.edit_mu, o.Permeability)
         o.LossTangent  = self._float(self.edit_loss, o.LossTangent)
@@ -210,7 +222,19 @@ class ConductorGroupPanel:
 
     def accept(self):
         o = self.obj
-        o.MaterialName  = self.edit_name.text().strip()
+        name = self.edit_name.text().strip()
+        if name:
+            from features.material_group import find_group_label_collision
+            collision = find_group_label_collision(o.Document, o, name)
+            if collision:
+                QtWidgets.QMessageBox.warning(
+                    self.form, "Name Already Used",
+                    f"Another group is already named '{name}'. Choose a "
+                    f"different Material Name."
+                )
+                return False
+            o.Label = name
+        o.MaterialName  = name
         o.ConductorType = self.combo_type.currentText()
         o.Conductivity  = self._float(self.edit_sigma, o.Conductivity)
         o.Permeability  = self._float(self.edit_mu, getattr(o, "Permeability", 1.0))

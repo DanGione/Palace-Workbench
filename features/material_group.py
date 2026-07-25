@@ -22,7 +22,7 @@ Color propagation:
 
 import FreeCAD
 import os
-from features import add_to_simulation
+from features import add_to_simulation, find_dielectric_groups, find_conductor_groups
 
 _DIEL_ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "DielectricGroup.svg")
 _COND_ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "ConductorGroup.svg")
@@ -363,4 +363,88 @@ def create_conductor_group(doc, mesh_attr=100, solids=None):
     obj.GroupTransparency = _COND_TRANSP
     add_to_simulation(doc, obj)
     doc.recompute()
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Shared-group lookup (find-or-create by MaterialName)
+#
+# Callers that generate many small features from one material (e.g. SMD
+# component bodies/coatings) should share a single group per material rather
+# than creating one per feature, to avoid cluttering the tree.
+# ---------------------------------------------------------------------------
+
+def find_dielectric_group_by_material(doc, material_name):
+    for obj in find_dielectric_groups(doc):
+        if getattr(obj, "MaterialName", "") == material_name:
+            return obj
+    return None
+
+
+def find_conductor_group_by_material(doc, material_name):
+    for obj in find_conductor_groups(doc):
+        if getattr(obj, "MaterialName", "") == material_name:
+            return obj
+    return None
+
+
+def find_group_label_collision(doc, obj, name):
+    """Return another Dielectric/ConductorGroup's Label if it already equals
+    *name*, else None. Excludes *obj* itself so re-accepting a group's own
+    unchanged name isn't flagged as colliding with itself.
+    """
+    for grp in find_dielectric_groups(doc) + find_conductor_groups(doc):
+        if grp is not obj and grp.Label == name:
+            return grp.Label
+    return None
+
+
+def get_or_create_dielectric_group(doc, material_name, permittivity=1.0, color=_DIEL_COLOR,
+                                    permeability=1.0, loss_tangent=0.0,
+                                    transparency=_DIEL_TRANSP, solids=None):
+    """Return the existing DielectricGroup named *material_name*, or create one.
+
+    *permittivity*/*color* default to the same values a hand-created
+    DielectricGroup gets -- callers that don't care about a specific look
+    (e.g. a newly tagged material awaiting the user's own edit) can omit them.
+    """
+    obj = find_dielectric_group_by_material(doc, material_name)
+    if obj is None:
+        mesh_attr = max((o.MeshAttribute for o in find_dielectric_groups(doc)), default=1) + 1
+        obj = create_dielectric_group(doc, mesh_attr=mesh_attr)
+        obj.Label = material_name
+        obj.MaterialName = material_name
+        obj.Permittivity = permittivity
+        obj.Permeability = permeability
+        obj.LossTangent = loss_tangent
+        obj.GroupColor = color
+        obj.GroupTransparency = transparency
+    if solids:
+        for s in solids:
+            obj.addObject(s)
+        doc.recompute()
+    return obj
+
+
+def get_or_create_conductor_group(doc, material_name, color=_COND_COLOR,
+                                   conductor_type="PEC", transparency=_COND_TRANSP,
+                                   solids=None):
+    """Return the existing ConductorGroup named *material_name*, or create one.
+
+    *color* defaults to the same value a hand-created ConductorGroup gets --
+    callers that don't care about a specific look can omit it.
+    """
+    obj = find_conductor_group_by_material(doc, material_name)
+    if obj is None:
+        mesh_attr = max((o.MeshAttribute for o in find_conductor_groups(doc)), default=99) + 1
+        obj = create_conductor_group(doc, mesh_attr=mesh_attr)
+        obj.Label = material_name
+        obj.MaterialName = material_name
+        obj.ConductorType = conductor_type
+        obj.GroupColor = color
+        obj.GroupTransparency = transparency
+    if solids:
+        for s in solids:
+            obj.addObject(s)
+        doc.recompute()
     return obj

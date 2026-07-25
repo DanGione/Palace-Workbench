@@ -21,6 +21,13 @@ except ImportError:
 
 _SWEEP_ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "Results.svg")
 
+# Distinct sentinel put into _OptimizationCoordinator._result_queue when the user
+# declines to proceed past the first-eval mesh-quality check -- objective() must tell
+# this apart from a generic None (real simulation failure) so it can raise
+# StopIteration (the coordinator's existing clean-cancellation path) instead of
+# RuntimeError (which _optimizer_thread only logs and then still reports success).
+_MESH_QUALITY_DECLINED = object()
+
 
 class _IterationSignalEmitter(QObject):
     """Module-level emitter so the results panel can react to each completed iteration."""
@@ -31,20 +38,6 @@ _iter_emitter = _IterationSignalEmitter()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _base_out_dir(doc):
-    """Return the base output directory for the active document."""
-    from commands.cmd_run import _output_dir
-    return _output_dir(doc)
-
-
-def _sweep_nc_path(doc):
-    return os.path.join(_base_out_dir(doc), "sweep.nc")
-
-
-def _run_dir(doc, run_index):
-    return os.path.join(_base_out_dir(doc), f"sweep_run_{run_index:03d}")
-
 
 def _build_param_sets(sweep_obj):
     """Return list of {varset: str, property: str, value: float} dicts for each run.
@@ -152,7 +145,7 @@ class _SweepCoordinator:
         self._console = console
         self._on_finished = on_finished
         self._run_index = 0
-        self._sweep_nc = _sweep_nc_path(doc)
+        self._mesh_quality_warnings = []
         self._cancelled = False
         # Store original param values to restore on cancel
         self._originals = self._save_originals()
@@ -203,7 +196,8 @@ class _SweepCoordinator:
             if self._console:
                 self._console.set_status(f"Sweep done ({self._run_index}/{len(self._param_sets)})")
             if self._on_finished:
-                self._on_finished(True, self._sweep_nc)
+                from palace.embedded_files import resolve
+                self._on_finished(True, resolve(self._sweep_obj, "SweepResultsFile"))
             return
 
         param_set = self._param_sets[self._run_index]
@@ -223,8 +217,8 @@ class _SweepCoordinator:
                 self._on_finished(False, None)
             return
 
-        out_dir = _run_dir(self._doc, self._run_index)
-        os.makedirs(out_dir, exist_ok=True)
+        from palace.embedded_files import new_scratch_dir
+        out_dir = new_scratch_dir(self._doc, f"sweep_run_{self._run_index:03d}")
 
         # Re-mesh and launch this run
         try:
@@ -258,17 +252,38 @@ class _SweepCoordinator:
         try:
             doc.recompute()
             t0_mesh = time.time()
-            mesh_path = generate_mesh(doc, out_dir, log_fn=_mesh_log)
+            mesh_path, geometry_path, quality = generate_mesh(doc, out_dir, log_fn=_mesh_log)
             mesh_elapsed = _fmt_elapsed(time.time() - t0_mesh)
             if sim:
                 sim.MeshFile = mesh_path
             try:
                 from commands.cmd_run import _update_mesh_object
-                _update_mesh_object(doc, mesh_path)
+                _update_mesh_object(doc, mesh_path, geometry_path=geometry_path)
             except Exception as exc:
                 FreeCAD.Console.PrintWarning(f"Palace sweep: mesh display update failed: {exc}\n")
 
-            passes, needs_merge = _build_passes(doc, out_dir, tmp_dir)
+            if quality.get("is_bad"):
+                from palace.meshing import format_quality_warning
+                warning = format_quality_warning(quality)
+                if self._console is not None:
+                    self._console.write(f"WARNING: {warning}\n")
+                if self._run_index == 0:
+                    reply = QtWidgets.QMessageBox.question(
+                        None, "Low-Quality Mesh",
+                        f"{warning}\n\nProceed with the sweep anyway?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No,
+                    )
+                    if reply != QtWidgets.QMessageBox.Yes:
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                        raise RuntimeError(
+                            "Sweep cancelled: user declined to proceed after "
+                            "mesh-quality check."
+                        )
+                else:
+                    self._mesh_quality_warnings.append(self._run_index)
+
+            passes, needs_merge = _build_passes(doc, tmp_dir)
 
             binary = sim.PalaceBinary if sim else ""
             if not binary or not os.path.isfile(binary):
@@ -290,15 +305,17 @@ class _SweepCoordinator:
                         self._on_finished(False, None)
                     return
                 try:
-                    from palace.results_db import load_dataset, append_sweep_point
+                    from palace.results_db import load_dataset
                     ds = load_dataset(nc_path)
-                    append_sweep_point(self._sweep_nc, ds, coord_name, coord_value)
+                    new_path = _embed_sweep_result(
+                        self._doc, self._sweep_obj, ds, coord_name, coord_value,
+                        run_idx, self._param_sets[run_idx], fresh=(run_idx == 0),
+                    )
                     ds.close()
                     FreeCAD.Console.PrintMessage(
-                        f"Palace sweep: appended run {run_idx + 1} → {self._sweep_nc}\n"
+                        f"Palace sweep: appended run {run_idx + 1} → embedded sweep.nc\n"
                     )
-                    _annotate_sweep_run(self._sweep_nc, run_idx, self._param_sets[run_idx])
-                    _iter_emitter.iteration_done.emit(str(self._sweep_nc))
+                    _iter_emitter.iteration_done.emit(new_path)
                     shutil.rmtree(out_dir, ignore_errors=True)
                 except Exception as exc:
                     FreeCAD.Console.PrintError(
@@ -308,10 +325,11 @@ class _SweepCoordinator:
                 self._run_index += 1
                 QTimer.singleShot(0, self._run_next)
 
-            _launch_passes(passes, needs_merge, out_dir, self._console, sim,
+            _launch_passes(passes, needs_merge, self._console, sim,
                            binary, num_procs, num_threads, t0_sim, mesh_elapsed,
                            tmp_dir=tmp_dir, on_complete=_on_run_complete,
-                           initial_status=f"Sweep {self._run_index + 1}/{n_total} | {param_str}")
+                           initial_status=f"Sweep {self._run_index + 1}/{n_total} | {param_str}",
+                           is_sweep_iteration=True)
 
         except Exception:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -325,21 +343,45 @@ class _SweepCoordinator:
         FreeCAD.Console.PrintMessage(f"Palace sweep: {msg}\n")
 
 
-def _annotate_sweep_run(sweep_nc, run_index, param_set, objective=None):
-    """Store per-run parameter values (and optional objective) as dataset attributes."""
+def _sweep_run_attrs(run_index, param_set, objective=None):
+    """Compute per-run annotation attrs (no I/O) for append_sweep_point's extra_attrs.
+
+    Kept defensive (never raises) since this is purely cosmetic metadata --
+    a malformed param shouldn't be able to break the actual sweep-point write.
+    """
     try:
-        import xarray as xr
-        ds = xr.open_dataset(str(sweep_nc))
-        ds.attrs[f"sweep_run_{run_index:03d}_params"] = json.dumps(
+        attrs = {f"sweep_run_{run_index:03d}_params": json.dumps(
             {p["property"]: p["value"] for p in param_set}
-        )
+        )}
         if objective is not None:
-            ds.attrs[f"sweep_run_{run_index:03d}_objective"] = float(objective)
-        ds.to_netcdf(str(sweep_nc) + ".tmp", format="NETCDF4")
-        ds.close()
-        os.replace(str(sweep_nc) + ".tmp", str(sweep_nc))
+            attrs[f"sweep_run_{run_index:03d}_objective"] = float(objective)
+        return attrs
     except Exception:
-        pass
+        return {}
+
+
+def _embed_sweep_result(doc, sweep_obj, ds, coord_name, coord_value, run_idx,
+                         param_set, objective=None, fresh=False):
+    """Fold one simulation's results into sweep_obj's embedded SweepResultsFile.
+
+    Copies the existing embedded sweep.nc (unless *fresh*, which starts a
+    clean file for a brand-new sweep/optimize run) to a fresh scratch path,
+    appends *ds* along *coord_name*/*coord_value* and annotates it in the same
+    write, then embeds the result back. Never writes directly into the
+    resolved property path -- only the scratch copy is touched before being
+    (re-)embedded.
+    """
+    from palace.results_db import append_sweep_point
+    from palace.embedded_files import new_scratch_file, embed, resolve, copy_for_rewrite
+
+    existing = "" if fresh else resolve(sweep_obj, "SweepResultsFile")
+    scratch = new_scratch_file(doc, "sweep")
+    if existing and os.path.isfile(existing):
+        copy_for_rewrite(existing, scratch)
+    append_sweep_point(scratch, ds, coord_name, coord_value,
+                        extra_attrs=_sweep_run_attrs(run_idx, param_set, objective))
+    embed(sweep_obj, "SweepResultsFile", scratch, "sweep.nc")
+    return resolve(sweep_obj, "SweepResultsFile")
 
 
 # ---------------------------------------------------------------------------
@@ -361,11 +403,11 @@ class _OptimizationCoordinator(QObject):
         self._params = params          # list of param dicts with min/max
         self._console = console
         self._on_finished = on_finished
-        self._sweep_nc = _sweep_nc_path(doc)
         self._eval_index = 0
         self._last_val = None
         self._best_val = float('inf')
         self._best_params = None
+        self._mesh_quality_warnings = []
         self._cancelled = False
         self._result_queue = queue.Queue()
         self._eval_event = threading.Event()
@@ -453,6 +495,8 @@ class _OptimizationCoordinator(QObject):
             self._eval_requested.emit()
             self._eval_event.wait()   # Block until simulation completes
             result = self._result_queue.get()
+            if result is _MESH_QUALITY_DECLINED:
+                raise StopIteration("Cancelled: mesh-quality check declined")
             if result is None:
                 raise RuntimeError("Simulation failed during optimization")
             return sign * result
@@ -526,8 +570,8 @@ class _OptimizationCoordinator(QObject):
             self._eval_event.set()
             return
 
-        out_dir = _run_dir(self._doc, eval_idx)
-        os.makedirs(out_dir, exist_ok=True)
+        from palace.embedded_files import new_scratch_dir
+        out_dir = new_scratch_dir(self._doc, f"sweep_run_{eval_idx:03d}")
 
         try:
             self._launch_eval(out_dir, eval_idx, param_set)
@@ -561,17 +605,38 @@ class _OptimizationCoordinator(QObject):
         try:
             doc.recompute()
             t0_mesh = time.time()
-            mesh_path = generate_mesh(doc, out_dir, log_fn=_mesh_log)
+            mesh_path, geometry_path, quality = generate_mesh(doc, out_dir, log_fn=_mesh_log)
             mesh_elapsed = _fmt_elapsed(time.time() - t0_mesh)
             if sim:
                 sim.MeshFile = mesh_path
             try:
                 from commands.cmd_run import _update_mesh_object
-                _update_mesh_object(doc, mesh_path)
+                _update_mesh_object(doc, mesh_path, geometry_path=geometry_path)
             except Exception as exc:
                 FreeCAD.Console.PrintWarning(f"Palace optimize: mesh display update failed: {exc}\n")
 
-            passes, needs_merge = _build_passes(doc, out_dir, tmp_dir)
+            if quality.get("is_bad"):
+                from palace.meshing import format_quality_warning
+                warning = format_quality_warning(quality)
+                if self._console is not None:
+                    self._console.write(f"WARNING: {warning}\n")
+                if eval_idx == 0:
+                    reply = QtWidgets.QMessageBox.question(
+                        None, "Low-Quality Mesh",
+                        f"{warning}\n\nProceed with the optimization anyway?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No,
+                    )
+                    if reply != QtWidgets.QMessageBox.Yes:
+                        self._cancelled = True
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                        self._result_queue.put(_MESH_QUALITY_DECLINED)
+                        self._eval_event.set()
+                        return
+                else:
+                    self._mesh_quality_warnings.append(eval_idx)
+
+            passes, needs_merge = _build_passes(doc, tmp_dir)
             binary = sim.PalaceBinary if sim else ""
             if not binary or not os.path.isfile(binary):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -580,7 +645,6 @@ class _OptimizationCoordinator(QObject):
             num_procs = int(getattr(sim, "NumProcesses", 1)) if sim else 1
             num_threads = int(getattr(sim, "NumThreads", 0)) if sim else 0
             t0_sim = time.time()
-            sweep_nc = self._sweep_nc
             objectives = json.loads(getattr(self._sweep_obj, "ObjectiveList", "[]") or "[]")
             if not objectives:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -601,12 +665,14 @@ class _OptimizationCoordinator(QObject):
                     return
                 try:
                     val = _compute_objective(nc_path, objectives)
-                    from palace.results_db import load_dataset, append_sweep_point
+                    from palace.results_db import load_dataset
                     ds = load_dataset(nc_path)
-                    append_sweep_point(sweep_nc, ds, "eval_index", eval_idx)
+                    new_path = _embed_sweep_result(
+                        self._doc, self._sweep_obj, ds, "eval_index", eval_idx,
+                        eval_idx, param_set, objective=val, fresh=(eval_idx == 0),
+                    )
                     ds.close()
-                    _annotate_sweep_run(sweep_nc, eval_idx, param_set, val)
-                    _iter_emitter.iteration_done.emit(str(sweep_nc))
+                    _iter_emitter.iteration_done.emit(new_path)
                     shutil.rmtree(out_dir, ignore_errors=True)
                     self._last_val = val
                     if val < self._best_val:
@@ -626,10 +692,10 @@ class _OptimizationCoordinator(QObject):
                 finally:
                     eval_event.set()
 
-            _launch_passes(passes, needs_merge, out_dir, self._console, sim,
+            _launch_passes(passes, needs_merge, self._console, sim,
                            binary, num_procs, num_threads, t0_sim, mesh_elapsed,
                            tmp_dir=tmp_dir, on_complete=_on_run_complete,
-                           initial_status=initial_status)
+                           initial_status=initial_status, is_sweep_iteration=True)
 
         except Exception:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -656,7 +722,9 @@ class _OptimizationCoordinator(QObject):
             if self._console:
                 self._console.set_status(status)
         if self._on_finished:
-            self._on_finished(success, self._sweep_nc if success else None)
+            from palace.embedded_files import resolve
+            sweep_nc = resolve(self._sweep_obj, "SweepResultsFile") if success else None
+            self._on_finished(success, sweep_nc)
 
     def _update_status(self, msg):
         try:
@@ -753,6 +821,13 @@ class CmdRunSweep:
         def _on_finished(success, sweep_nc):
             global _active_coordinator
             _active_coordinator = None
+            warned = getattr(coord, "_mesh_quality_warnings", [])
+            warn_note = ""
+            if warned:
+                warn_note = (
+                    f"\n\nNote: {len(warned)} iteration(s) had mesh-quality warnings "
+                    f"— check the Palace console log for details."
+                )
             if success and sweep_nc and os.path.isfile(sweep_nc):
                 try:
                     from panels.sweep_results_panel import SweepResultsPanel
@@ -764,24 +839,25 @@ class CmdRunSweep:
                     )
                 QtWidgets.QMessageBox.information(
                     None, "Sweep Complete",
-                    f"Sweep finished.\nResults: {sweep_nc}"
+                    f"Sweep finished.\nResults: {sweep_nc}{warn_note}"
                 )
             elif not success:
                 QtWidgets.QMessageBox.warning(
                     None, "Sweep Failed",
                     "The sweep did not complete successfully.\n"
-                    "Check the FreeCAD console for details."
+                    f"Check the FreeCAD console for details.{warn_note}"
                 )
 
-        sweep_nc_path = _sweep_nc_path(doc)
-        sweep_obj.SweepResultsFile = sweep_nc_path
-        # Remove any stale sweep.nc from a previous run so results don't accumulate
-        # across separate runs or carry over incompatible sweep coordinates.
-        try:
-            if os.path.isfile(sweep_nc_path):
-                os.remove(sweep_nc_path)
-        except Exception as exc:
-            FreeCAD.Console.PrintWarning(f"Palace sweep: could not clear old sweep.nc: {exc}\n")
+        # Explicitly clear any previously-embedded sweep.nc before starting.
+        # fresh=True on the first run/eval alone isn't enough: if that very
+        # first _embed_sweep_result() call raises (e.g. a bad dataset) before
+        # reaching embed(), SweepResultsFile is left untouched -- if it still
+        # held a stale, unrelated prior sweep's data, the next run (fresh=False)
+        # would silently copy that stale file forward and merge new data onto
+        # it. Clearing here guarantees a failed first point can only ever
+        # result in an empty SweepResultsFile, never a resurrected old sweep.
+        from palace.embedded_files import clear
+        clear(sweep_obj, "SweepResultsFile")
 
         if mode == "Optimize":
             params = json.loads(sweep_obj.SweepParams or "[]")
@@ -846,18 +922,6 @@ class CmdViewSweep:
         return FreeCAD.ActiveDocument is not None
 
     def Activated(self):
-        doc = FreeCAD.ActiveDocument
         from panels.sweep_results_panel import SweepResultsPanel
         viewer = SweepResultsPanel.get_or_create()
-
-        # Auto-load from sweep object or default path
-        from features import find_sweep
-        sweep_obj = find_sweep(doc) if doc else None
-        nc_path = None
-        if sweep_obj:
-            nc_path = getattr(sweep_obj, "SweepResultsFile", "") or _sweep_nc_path(doc)
-        elif doc:
-            nc_path = _sweep_nc_path(doc)
-
-        if nc_path and os.path.isfile(nc_path):
-            viewer.load_nc(nc_path)
+        viewer.refresh_from_active_document()

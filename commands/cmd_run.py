@@ -326,7 +326,7 @@ def _port_face_normal(port_obj):
         return (0.0, 0.0, 1.0)
 
 
-def _update_wave_port_impedances(doc, passes, out_dir):
+def _update_wave_port_impedances(doc, passes):
     """Extract Z_c from probe fields and store on each WavePort.CharacteristicZ.
 
     Returns {port_idx: list[complex]} — per-frequency Z0 for each wave port
@@ -418,25 +418,22 @@ def _update_wave_port_impedances(doc, passes, out_dir):
     return z0_data
 
 
-def _output_dir(doc):
-    if doc.FileName:
-        stem = os.path.splitext(os.path.basename(doc.FileName))[0]
-        return os.path.join(os.path.dirname(doc.FileName), stem)
-    return os.path.join(tempfile.gettempdir(), "palace_output")
+def _update_mesh_object(doc, mesh_path, geometry_path=None):
+    """Update the PalaceMesh feature object and refresh its viewport display.
 
-
-def _update_mesh_object(doc, mesh_path):
-    """Update the PalaceMesh feature object and refresh its viewport display."""
+    Returns the PalaceMesh object so callers can re-point SimulationContainer.MeshFile
+    at its resolved (embedded, permanent) MeshFile rather than the caller's scratch
+    mesh_path -- the scratch source is typically rmtree'd right after this call.
+    """
     from features.mesh import create_palace_mesh
+    from palace.embedded_files import embed
     mesh_obj = create_palace_mesh(doc)
-    mesh_obj.MeshFile = mesh_path
+    embed(mesh_obj, "MeshFile", mesh_path, "mesh.msh")
+    if geometry_path:
+        embed(mesh_obj, "GeometryFile", geometry_path, "geometry.step")
     mesh_obj.Proxy.execute(mesh_obj)
     doc.recompute()
-
-
-def _results_nc_path(doc):
-    """Return the path where results.nc is written (inside the named output folder)."""
-    return os.path.join(_output_dir(doc), "results.nc")
+    return mesh_obj
 
 
 def _find_excited_ports(doc):
@@ -467,15 +464,15 @@ def _clear_stale_csv(directory):
             pass
 
 
-def _build_passes(doc, out_dir, tmp_dir):
+def _build_passes(doc, tmp_dir):
     """Generate Palace config file(s) and return (passes, needs_merge).
 
     passes      : list of (config_path, pass_output_dir, port_index_or_None)
-                  pass_output_dir is under tmp_dir so Palace CSVs go there.
+                  Both the config and pass_output_dir live under tmp_dir --
+                  pure scratch, deleted once the run completes. The config
+                  that actually ran is embedded separately on success (see
+                  _embed_run_config), not read back from this location.
     needs_merge : True when more than one pass was built (S-matrix merge required)
-
-    Config JSON files are written to out_dir (permanent); Palace output CSVs
-    go to tmp_dir subdirectories and are deleted after the dataset is built.
     """
     from palace.config import generate_config
 
@@ -484,7 +481,7 @@ def _build_passes(doc, out_dir, tmp_dir):
     if len(excited_ports) <= 1:
         tmp_pass_dir = os.path.join(tmp_dir, "output")
         os.makedirs(tmp_pass_dir, exist_ok=True)
-        config_path = os.path.join(out_dir, "palace_config.json")
+        config_path = os.path.join(tmp_dir, "palace_config.json")
         cfg = generate_config(doc, output_override=tmp_pass_dir + "/")
         with open(config_path, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, indent=2)
@@ -495,7 +492,7 @@ def _build_passes(doc, out_dir, tmp_dir):
     for p in excited_ports:
         tmp_pass_dir = os.path.join(tmp_dir, f"output_port{p.PortIndex}")
         os.makedirs(tmp_pass_dir, exist_ok=True)
-        config_path = os.path.join(out_dir, f"palace_config_port{p.PortIndex}.json")
+        config_path = os.path.join(tmp_dir, f"palace_config_port{p.PortIndex}.json")
         cfg = generate_config(
             doc,
             only_excitation=p.PortIndex,
@@ -508,10 +505,55 @@ def _build_passes(doc, out_dir, tmp_dir):
     return passes, True
 
 
-def _on_done(success, message, out_dir, passes, needs_merge,
+def _embed_run_config(doc, sim, passes):
+    """Embed the Palace config(s) that actually ran into sim.ConfigFile.
+
+    Single-pass: embed the one config file directly. Multi-pass (multi-port
+    excitation): App::PropertyFileIncludedList does not exist, so there is
+    only one ConfigFile slot -- combine all pass configs into one JSON object
+    keyed by port rather than silently keeping only one of them.
+    """
+    from palace.embedded_files import new_scratch_file, embed
+
+    if sim is None:
+        return
+
+    if len(passes) == 1:
+        config_path, _, _ = passes[0]
+        if os.path.isfile(config_path):
+            embed(sim, "ConfigFile", config_path, "palace_config.json")
+        return
+
+    combined = {}
+    for config_path, _, port_idx in passes:
+        if os.path.isfile(config_path):
+            with open(config_path, encoding="utf-8") as fh:
+                combined[f"port_{port_idx}"] = json.load(fh)
+    if combined:
+        scratch = new_scratch_file(doc, "palace_config")
+        with open(scratch, "w", encoding="utf-8") as fh:
+            json.dump(combined, fh, indent=2)
+        embed(sim, "ConfigFile", scratch, "palace_config.json")
+
+
+def _on_done(success, message, passes, needs_merge, sim,
              console=None, t0=None, mesh_elapsed=None, tmp_dir=None,
-             on_complete=None):
-    """Called on the main thread when all passes have completed."""
+             on_complete=None, is_sweep_iteration=False):
+    """Called on the main thread when all passes have completed.
+
+    *is_sweep_iteration* is True for a sweep/optimize point (as opposed to an
+    interactive Run). Field-probe (E/B) data is skipped and ResultsFile isn't
+    re-embedded in that case -- nothing reads either back mid-sweep, and a
+    sweep can be hundreds of iterations, so the saved I/O and .FCStd size are
+    significant (see CLAUDE.md's embedding-overhead invariant).
+
+    *sim* is the SimulationContainer the run was actually launched against
+    (threaded through from _launch_passes rather than re-derived from
+    FreeCAD.ActiveDocument here) -- a long-running background Palace run can
+    finish well after the user has switched to, or opened, a different
+    document, and re-deriving "the" active simulation at completion time
+    would silently embed this run's results into an unrelated document.
+    """
     CmdRun._coordinator = None  # allow a new run to start
 
     if not success:
@@ -538,15 +580,14 @@ def _on_done(success, message, out_dir, passes, needs_merge,
     if sim_elapsed is not None:
         FreeCAD.Console.PrintMessage(f"Palace: Simulation time: {sim_elapsed}\n")
 
-    tmp_out = tmp_dir or out_dir
-    final_csv = os.path.join(tmp_out, "output", "port-S.csv")
+    final_csv = os.path.join(tmp_dir, "output", "port-S.csv")
 
     if needs_merge:
         if console is not None:
             console.write("[Post] Merging S-matrix…\n")
         try:
             from palace.post_process import merge_s_matrix
-            merged_dir = os.path.join(tmp_out, "output")
+            merged_dir = os.path.join(tmp_dir, "output")
             os.makedirs(merged_dir, exist_ok=True)
             pass_dirs = [d for _, d, _ in passes]
             merge_s_matrix(pass_dirs, final_csv)
@@ -572,32 +613,46 @@ def _on_done(success, message, out_dir, passes, needs_merge,
         except Exception as exc:
             FreeCAD.Console.PrintError(f"Palace: Failed to parse S-matrix: {exc}\n")
 
-    # Parse probe field CSVs from each pass directory in tmp
+    # Parse probe field CSVs from each pass directory in tmp -- skipped during
+    # sweep/optimize iterations: nothing reads E/B field data back (confirmed:
+    # _compute_objective only reads S_phase/S_mag_db; the Sweep Results and
+    # S-Parameter panels only ever plot S_mag_db/S_phase), and this data
+    # dominates the per-iteration payload (~70x the S-parameter data in a real
+    # crash-triggering run). CharacteristicZ/Z0 extraction is unaffected --
+    # _update_wave_port_impedances() below independently re-parses these same
+    # probe CSVs itself.
     e_data_combined, b_data_combined = {}, {}
+    if not is_sweep_iteration:
+        try:
+            from palace.post_process import parse_probe_csv
+            for _, pass_dir, _ in passes:
+                e_path = os.path.join(pass_dir, "probe-E.csv")
+                b_path = os.path.join(pass_dir, "probe-B.csv")
+                if os.path.isfile(e_path):
+                    _, ed = parse_probe_csv(e_path)
+                    e_data_combined.update(ed)
+                if os.path.isfile(b_path):
+                    _, bd = parse_probe_csv(b_path)
+                    b_data_combined.update(bd)
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(f"Palace: Could not parse probe CSVs: {exc}\n")
+
+    sim_obj = sim
     try:
-        from palace.post_process import parse_probe_csv
-        for _, pass_dir, _ in passes:
-            e_path = os.path.join(pass_dir, "probe-E.csv")
-            b_path = os.path.join(pass_dir, "probe-B.csv")
-            if os.path.isfile(e_path):
-                _, ed = parse_probe_csv(e_path)
-                e_data_combined.update(ed)
-            if os.path.isfile(b_path):
-                _, bd = parse_probe_csv(b_path)
-                b_data_combined.update(bd)
-    except Exception as exc:
-        FreeCAD.Console.PrintWarning(f"Palace: Could not parse probe CSVs: {exc}\n")
+        doc = sim_obj.Document if sim_obj is not None else None
+    except ReferenceError:
+        # sim was deleted from its document while the run was in flight.
+        sim_obj, doc = None, None
 
     # Extract characteristic impedance (per frequency, per port)
     z0_per_port = {}
     try:
-        doc = FreeCAD.ActiveDocument
         if doc is not None:
-            z0_per_port = _update_wave_port_impedances(doc, passes, out_dir)
+            z0_per_port = _update_wave_port_impedances(doc, passes)
     except Exception as exc:
         FreeCAD.Console.PrintError(f"Palace: Z_c extraction failed: {exc}\n")
 
-    # Read config dict for metadata embedding
+    # Read config dict for metadata embedding, and embed the config that ran
     config_dict = None
     first_cfg_path = passes[0][0] if passes else None
     if first_cfg_path and os.path.isfile(first_cfg_path):
@@ -606,16 +661,20 @@ def _on_done(success, message, out_dir, passes, needs_merge,
                 config_dict = json.load(fh)
         except Exception:
             pass
+    if doc is not None and sim_obj is not None:
+        try:
+            _embed_run_config(doc, sim_obj, passes)
+        except Exception as exc:
+            FreeCAD.Console.PrintError(f"Palace: Failed to embed config: {exc}\n")
 
-    # Build and save the results dataset
+    # Build and embed the results dataset
     nc_path = None
     if freq_ghz:
         if console is not None:
             console.write("[Post] Building results database…\n")
         try:
             from palace.results_db import build_dataset, save_dataset
-            doc = FreeCAD.ActiveDocument
-            nc_path = _results_nc_path(doc) if doc else os.path.join(out_dir, "results.nc")
+            from palace.embedded_files import new_scratch_file, embed, resolve
             ds = build_dataset(
                 freq_ghz, s_mag_db, s_phase_deg,
                 e_data=e_data_combined or None,
@@ -627,10 +686,28 @@ def _on_done(success, message, out_dir, passes, needs_merge,
                     "mesh_elapsed": mesh_elapsed or "",
                 },
             )
-            save_dataset(ds, nc_path)
-            FreeCAD.Console.PrintMessage(f"Palace: Results database → {nc_path}\n")
-            if console is not None:
-                console.write(f"[Done] Results database → {nc_path}\n")
+            # doc is not None iff sim_obj is not None (both set together from
+            # sim.Document, or both None via the ReferenceError guard above).
+            if doc is not None:
+                scratch = new_scratch_file(doc, "results")
+                save_dataset(ds, scratch)
+                if is_sweep_iteration:
+                    # Nothing reads SimulationContainer.ResultsFile mid-sweep;
+                    # skip the embed to avoid a wasted full re-zip of the
+                    # .FCStd on the next save. _on_run_complete only needs a
+                    # real path to load_dataset() back for _compute_objective.
+                    nc_path = scratch
+                else:
+                    embed(sim_obj, "ResultsFile", scratch, "results.nc")
+                    nc_path = resolve(sim_obj, "ResultsFile")
+                    FreeCAD.Console.PrintMessage(f"Palace: Results database → {nc_path}\n")
+                    if console is not None:
+                        console.write(f"[Done] Results database → {nc_path}\n")
+            else:
+                FreeCAD.Console.PrintWarning(
+                    "Palace: No active document/simulation found — "
+                    "results database not saved.\n"
+                )
         except Exception as exc:
             FreeCAD.Console.PrintError(f"Palace: Failed to save results database: {exc}\n")
             nc_path = None
@@ -678,9 +755,10 @@ def _find_mesh_file(doc):
     return None
 
 
-def _launch_passes(passes, needs_merge, out_dir, console, sim, binary,
+def _launch_passes(passes, needs_merge, console, sim, binary,
                    num_procs, num_threads, t0_sim, mesh_elapsed=None, tmp_dir=None,
-                   on_complete=None, initial_status="Running Palace…"):
+                   on_complete=None, initial_status="Running Palace…",
+                   is_sweep_iteration=False):
     """Create _PassWorker objects, set up console tabs, and start the coordinator.
 
     Must be called on the main thread.  Sets CmdRun._coordinator.
@@ -720,8 +798,8 @@ def _launch_passes(passes, needs_merge, out_dir, console, sim, binary,
     coordinator = _SimCoordinator(workers, parallel, passes, labels, console)
     coordinator.all_done.connect(
         lambda ok, msg: _on_done(
-            ok, msg, out_dir, passes, needs_merge, console, t0_sim, mesh_elapsed, tmp_dir,
-            on_complete=on_complete,
+            ok, msg, passes, needs_merge, sim, console, t0_sim, mesh_elapsed, tmp_dir,
+            on_complete=on_complete, is_sweep_iteration=is_sweep_iteration,
         )
     )
     coordinator.start_all()
@@ -798,8 +876,6 @@ class CmdRunOnly:
             )
             return
 
-        out_dir = _output_dir(doc)
-        os.makedirs(out_dir, exist_ok=True)
         sim = next((o for o in doc.Objects if hasattr(o, "SimulationType")), None)
 
         if sim:
@@ -822,24 +898,29 @@ class CmdRunOnly:
         tmp_dir = tempfile.mkdtemp(prefix="palace_")
         try:
             _log(f"Palace: Using existing mesh: {mesh_path}\n")
-            passes, needs_merge = _build_passes(doc, out_dir, tmp_dir)
+            passes, needs_merge = _build_passes(doc, tmp_dir)
             n = len(passes)
             _log(f"Palace: {n} excitation pass{'es' if n > 1 else ''} prepared.\n")
 
             binary = sim.PalaceBinary if sim else ""
             if not binary or not os.path.isfile(binary):
+                if sim:
+                    _embed_run_config(doc, sim, passes)
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 if console is not None:
                     console.set_status("No binary configured")
                 QtWidgets.QMessageBox.information(
                     None,
                     "Files Generated",
-                    f"{'Configs' if n > 1 else 'Config'} written to:\n{out_dir}\n\n"
+                    f"{'Configs' if n > 1 else 'Config'} embedded in the document.\n"
+                    "Use 'Export Config…' to save it to disk.\n\n"
                     "Set the Palace binary path in the Simulation settings to run.",
                 )
                 return
 
             if CmdRun._coordinator is not None and CmdRun._coordinator.is_running():
+                if sim:
+                    _embed_run_config(doc, sim, passes)
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 QtWidgets.QMessageBox.warning(
                     None, "Palace Running",
@@ -851,7 +932,7 @@ class CmdRunOnly:
             num_procs   = int(getattr(sim, "NumProcesses", 1)) if sim else 1
             num_threads = int(getattr(sim, "NumThreads",   0)) if sim else 0
             t0_sim = time.time()
-            _launch_passes(passes, needs_merge, out_dir, console, sim,
+            _launch_passes(passes, needs_merge, console, sim,
                            binary, num_procs, num_threads, t0_sim, tmp_dir=tmp_dir)
 
         except Exception as exc:
@@ -888,11 +969,7 @@ class CmdRun:
 
     def Activated(self):
         doc = FreeCAD.ActiveDocument
-        out_dir = _output_dir(doc)
-        os.makedirs(out_dir, exist_ok=True)
         sim = next((o for o in doc.Objects if hasattr(o, "SimulationType")), None)
-        if sim:
-            sim.OutputDir = out_dir
 
         console = None
         try:
@@ -916,38 +993,73 @@ class CmdRun:
             # Step 1 — mesh (synchronous)
             _log("Palace: Generating mesh…\n")
             from palace.meshing import generate_mesh
+            from palace.embedded_files import new_scratch_dir
+            mesh_dir = new_scratch_dir(doc, "mesh_run")
             t0_mesh = time.time()
-            mesh_path = generate_mesh(doc, out_dir, log_fn=_mesh_log)
+            mesh_path, geometry_path, quality = generate_mesh(doc, mesh_dir, log_fn=_mesh_log)
             mesh_elapsed = _fmt_elapsed(time.time() - t0_mesh)
             sim.MeshFile = mesh_path
             try:
-                _update_mesh_object(doc, mesh_path)
+                mesh_obj = _update_mesh_object(doc, mesh_path, geometry_path=geometry_path)
+                # Re-point at the embedded (permanent) copy before deleting mesh_dir --
+                # generate_config() (called next, via _build_passes) reads sim.MeshFile
+                # to populate the Palace JSON config, so it must not still reference
+                # the scratch path that's about to be removed.
+                sim.MeshFile = mesh_obj.MeshFile
+                # embed() copies rather than consumes a source living in a
+                # subdirectory of the transient dir (only a source file placed
+                # directly at the transient dir's root gets moved/removed) --
+                # mesh_dir must be cleaned up explicitly or it leaks on every run.
+                shutil.rmtree(mesh_dir, ignore_errors=True)
             except Exception as exc:
                 FreeCAD.Console.PrintWarning(f"Palace: mesh display update failed: {exc}\n")
             _log(f"Palace: Mesh written to {mesh_path}\n")
             _log(f"Palace: Mesh generated in {mesh_elapsed}\n")
 
+            if quality.get("is_bad"):
+                from palace.meshing import format_quality_warning
+                warning = format_quality_warning(quality)
+                if console is not None:
+                    console.write(f"WARNING: {warning}\n")
+                reply = QtWidgets.QMessageBox.question(
+                    None, "Low-Quality Mesh",
+                    f"{warning}\n\nRun the simulation anyway?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    _log("Palace: Run cancelled (mesh quality check declined).\n")
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    if console is not None:
+                        console.set_status("Cancelled (low-quality mesh)")
+                    return
+
             # Step 2 — build config(s) on the main thread
             _log("Palace: Writing config(s)…\n")
-            passes, needs_merge = _build_passes(doc, out_dir, tmp_dir)
+            passes, needs_merge = _build_passes(doc, tmp_dir)
             n = len(passes)
             _log(f"Palace: {n} excitation pass{'es' if n > 1 else ''} prepared.\n")
 
             # Step 3 — launch Palace (or inform user if binary not set)
             binary = sim.PalaceBinary if sim else ""
             if not binary or not os.path.isfile(binary):
+                if sim:
+                    _embed_run_config(doc, sim, passes)
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 if console is not None:
                     console.set_status("No binary configured")
                 QtWidgets.QMessageBox.information(
                     None,
                     "Files Generated",
-                    f"{'Configs' if n > 1 else 'Config'} written to:\n{out_dir}\n\n"
+                    f"{'Configs' if n > 1 else 'Config'} embedded in the document.\n"
+                    "Use 'Export Config…' to save it to disk.\n\n"
                     "Set the Palace binary path in the Simulation settings to run.",
                 )
                 return
 
             if CmdRun._coordinator is not None and CmdRun._coordinator.is_running():
+                if sim:
+                    _embed_run_config(doc, sim, passes)
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 QtWidgets.QMessageBox.warning(
                     None,
@@ -960,7 +1072,7 @@ class CmdRun:
             num_procs   = int(getattr(sim, "NumProcesses", 1)) if sim else 1
             num_threads = int(getattr(sim, "NumThreads",   0)) if sim else 0
             t0_sim = time.time()
-            _launch_passes(passes, needs_merge, out_dir, console, sim,
+            _launch_passes(passes, needs_merge, console, sim,
                            binary, num_procs, num_threads, t0_sim, mesh_elapsed,
                            tmp_dir=tmp_dir)
 

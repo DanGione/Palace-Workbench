@@ -55,6 +55,15 @@ For a 5 GHz simulation in mm: λ = 300/5 = 60 mm in free space; substrate-loaded
 
 The mesh is too fine. Check your element size settings. A fine **Conductor size** (e.g., 0.01 mm) with no **Refine distance** set will refine the entire model near every conductor face. Either increase Conductor size or set a Refine distance to limit how far the refinement reaches.
 
+**Palace warns about low mesh quality / results look wrong even though meshing "succeeded"**
+
+Palace checks tetrahedron quality after every mesh generation and warns (Report View + Palace console, and a Yes/No prompt on a single Run or the first pass of a sweep — see [Simulation Reference → Mesh quality check](simulation-reference.md#mesh-quality-check)) when it finds degenerate or sliver elements. In practice this almost always comes from **one Conductor or Dielectric group mixing a very thin feature with a much larger body** — e.g. a 25–50 µm trace or ground-plane layer in the same group as a millimeter-scale connector shell or via barrel. **Conductor size** applies to every surface in that group, so:
+
+- Too coarse (or left blank) for the thin feature → Gmsh can't resolve it and produces near-zero-quality (sometimes inverted) tetrahedra right at the seam.
+- Fine enough for the thin feature but applied to the whole group → the large body gets meshed at that same fine resolution too, which can multiply the total element count far more than the thin feature alone would need.
+
+Set **Conductor size** to roughly the thinnest feature's own thickness in that group, and set a **Refine distance** so the fine region doesn't have to reach across the whole model — then re-check the warning is gone. Note that exact-touching vs. slightly-overlapping geometry is *not* the deciding factor here; a real interference fit between the two solids doesn't materially change element quality if the size setting is still too coarse for the thinner one. See also [Geometry Guide → Common pitfalls](geometry-guide.md#common-pitfalls).
+
 ---
 
 ## Simulation
@@ -89,8 +98,9 @@ Palace may have run but produced no valid output. Check the FreeCAD console for 
 
 **S-parameter viewer shows nothing after the run**
 
-- Check that `results.nc` exists in the output folder (next to your `.FCStd` file, in a subfolder named after the file).
-- Click **Load…** in the S-Parameter Viewer and manually navigate to `results.nc`.
+- `results.nc` is embedded inside the `.FCStd` file, not written next to it — check the Simulation object's **ResultsFile** property is set (Report View also logs a "Results database →" message after a successful run).
+- Use **Palace → Export Config…**/**Export Mesh…** to confirm a run actually completed and produced embedded output.
+- Click **Load…** in the S-Parameter Viewer to open a different (e.g. externally-exported) `results.nc` file.
 - If the file exists but the viewer is blank, the simulation may have solved only one port and produced a 1×1 S-matrix with no cross-terms. Check that S11 is visible in the checkboxes.
 
 **"xarray is required" error when loading results**

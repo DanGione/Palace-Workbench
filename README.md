@@ -6,6 +6,8 @@ A FreeCAD 1.0 workbench for 3D electromagnetic FEM simulation using the
 Supports driven S-parameter sweeps, eigenmode analysis, and electrostatic
 simulations — all configured and launched from the FreeCAD GUI.
 
+![Palace Workbench in FreeCAD, showing a meshed Wilkinson splitter model alongside the S-parameter viewer](docs/images/Palace_Simulator_Screenshot.png)
+
 ## Quick Start (Docker)
 
 **Requirements:** [Docker Desktop](https://www.docker.com/products/docker-desktop/)

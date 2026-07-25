@@ -42,6 +42,11 @@ def find_conductor_groups(doc):
             if hasattr(obj, "ConductorType") and hasattr(obj, "MeshAttribute")]
 
 
+def find_components(doc):
+    return [obj for obj in doc.Objects
+            if hasattr(obj, "ChildBasePlacements") and hasattr(obj, "ComponentKind")]
+
+
 def find_impedance_boundaries(doc):
     objs = [obj for obj in doc.Objects
             if hasattr(obj, "Rs") and hasattr(obj, "MeshAttribute")]

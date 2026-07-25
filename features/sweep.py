@@ -27,8 +27,8 @@ class SweepContainer:
              "Grid: cartesian product of all value lists.  "
              "Sequential: zip value lists (all must be the same length).",
              ["Grid", "Sequential"])
-        _add(obj, "App::PropertyString", "SweepResultsFile", "Sweep",
-             "Path to the assembled sweep results NetCDF4 file (set automatically on run).", "")
+        _add(obj, "App::PropertyFileIncluded", "SweepResultsFile", "Sweep",
+             "Embedded sweep/optimization results NetCDF4 file (set automatically on run).", "")
         _add(obj, "App::PropertyString", "SweepStatus", "Sweep",
              "Current sweep status (read-only, updated during run).", "")
 
@@ -59,6 +59,12 @@ class SweepContainer:
 
     def onDocumentRestored(self, obj):
         self._init_properties(obj)
+        from palace.embedded_files import migrate_legacy_string_property, legacy_sibling_path
+        migrate_legacy_string_property(
+            obj, "SweepResultsFile", "Sweep",
+            "Embedded sweep/optimization results NetCDF4 file (set automatically on run).",
+            legacy_hint=legacy_sibling_path(obj.Document, "sweep.nc"),
+        )
 
     def __getstate__(self):
         return None
