@@ -7,7 +7,7 @@ set -e
 # We symlink both so the workbench is found regardless of which path is active.
 for MOD_DIR in "${HOME}/.local/share/FreeCAD/Mod" "${HOME}/.FreeCAD/Mod"; do
     mkdir -p "${MOD_DIR}"
-    ln -sfn /workspace "${MOD_DIR}/PalaceWorkbench"
+    ln -sfn /opt/palace-workbench "${MOD_DIR}/PalaceWorkbench"
 done
 
 mkdir -p ~/.vnc
