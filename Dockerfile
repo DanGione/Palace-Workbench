@@ -49,7 +49,10 @@ RUN conda install -y -c conda-forge --override-channels "freecad=1.0.0" \
 RUN pip install --no-cache-dir gmsh numpy scipy cmake matplotlib xarray netCDF4
 
 # ── Palace (AWSLabs) — builds all dependencies via CMake superbuild ──────────
-RUN git clone --depth=1 https://github.com/awslabs/palace.git /tmp/palace-src \
+# Pinned to v0.17.0 (latest tagged release as of writing) instead of tracking
+# main — an unpinned clone silently picks up whatever's newest upstream on
+# every image rebuild, making builds non-reproducible and liable to break.
+RUN git clone --depth=1 --branch v0.17.0 https://github.com/awslabs/palace.git /tmp/palace-src \
     && cmake -S /tmp/palace-src -B /tmp/palace-src/build \
              -DCMAKE_BUILD_TYPE=Release \
              -DCMAKE_INSTALL_PREFIX=/usr/local \
