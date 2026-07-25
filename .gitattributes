@@ -1,0 +1,12 @@
+# Normalize all text files to LF on checkout, regardless of a
+# contributor's local core.autocrlf — this repo's scripts run inside
+# Linux containers, and a CRLF shebang breaks them with a misleading
+# "not found" error instead of a clear bad-interpreter message.
+* text=auto eol=lf
+
+# Generated/binary artifacts: never touch line endings or diff as text.
+*.FCStd binary
+*.FCBak binary
+*.step binary
+*.msh binary
+*.nc binary
