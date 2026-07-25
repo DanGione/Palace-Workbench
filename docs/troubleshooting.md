@@ -17,6 +17,25 @@ docker compose down
 docker compose up
 ```
 
+**Devcontainer fails with `postStartCommand ... not found` (Windows)**
+
+If "Reopen in Container" builds successfully but then fails with something like:
+```
+Running the postStartCommand from devcontainer.json...
+/bin/sh: 1: ./.devcontainer/start-gui.sh: not found
+```
+this usually isn't a missing file — the container itself is fine, only this one startup step failed. Ubuntu's `/bin/sh` (`dash`) reports the same generic "not found" whether a script is truly missing *or* its shebang can't be resolved, e.g. a `#!/bin/bash` line saved with Windows CRLF line endings instead of LF. This is common on a fresh Windows machine, since Git for Windows' default `core.autocrlf=true` converts every text file to CRLF on checkout, including this repo's shell scripts.
+
+To confirm and fix, open a terminal *inside* the running container (VS Code lets you do this even though the lifecycle command failed) and run:
+```
+file /workspace/.devcontainer/start-gui.sh
+```
+If it reports "with CRLF line terminators", strip them — this edits the real file on your host through the bind mount:
+```
+sed -i 's/\r$//' /workspace/.devcontainer/start-gui.sh
+```
+Then Rebuild Container. To stop this recurring on the same machine, also run `git config core.autocrlf input` (or `false`) in the repo and re-checkout so future pulls don't reintroduce CRLF.
+
 **FreeCAD window appears zoomed in / only part of the window is visible**
 
 This is a noVNC scaling issue on HiDPI (Retina) displays. Make sure you are using the `resize=scale` URL parameter:
