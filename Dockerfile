@@ -29,8 +29,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Miniconda ────────────────────────────────────────────────────────────────
+# Pinned to a py312 build (not "latest") because conda-forge's freecad=1.0.0
+# has no build past Python 3.13 — "latest" drifts forward (now py314) and
+# breaks the freecad install below with an unsatisfiable-environment error.
 ENV CONDA_DIR=/opt/conda
-RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-py312_26.5.3-1-Linux-x86_64.sh \
         -O /tmp/miniconda.sh \
     && bash /tmp/miniconda.sh -b -p ${CONDA_DIR} \
     && rm /tmp/miniconda.sh \
