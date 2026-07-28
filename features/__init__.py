@@ -42,10 +42,29 @@ def find_conductor_groups(doc):
             if hasattr(obj, "ConductorType") and hasattr(obj, "MeshAttribute")]
 
 
+def find_components(doc):
+    return [obj for obj in doc.Objects
+            if hasattr(obj, "ChildBasePlacements") and hasattr(obj, "ComponentKind")]
+
+
 def find_impedance_boundaries(doc):
     objs = [obj for obj in doc.Objects
             if hasattr(obj, "Rs") and hasattr(obj, "MeshAttribute")]
     return sorted(objs, key=lambda o: o.PortIndex)
+
+
+def get_available_s_params(doc):
+    """Return list of (row, col) S-param index pairs producible by the current port config.
+
+    For each excited port j, Palace measures S_ij at all port indices i.
+    Returns an empty list if no ports exist.
+    """
+    if doc is None:
+        return []
+    all_ports = find_lumped_ports(doc) + find_wave_ports(doc)
+    all_idx   = sorted({p.PortIndex for p in all_ports})
+    excited   = sorted({p.PortIndex for p in all_ports if getattr(p, "Excitation", True)})
+    return [(i, j) for j in excited for i in all_idx]
 
 
 def next_port_index(doc):
@@ -54,6 +73,13 @@ def next_port_index(doc):
     if not all_ports:
         return 1
     return max(p.PortIndex for p in all_ports) + 1
+
+
+def find_sweep(doc):
+    for obj in doc.Objects:
+        if hasattr(obj, "SweepParams") and hasattr(obj, "SweepMode"):
+            return obj
+    return None
 
 
 def find_palace_mesh(doc):

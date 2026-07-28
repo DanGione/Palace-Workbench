@@ -1,17 +1,10 @@
 import FreeCAD
-import FreeCADGui
 import os
+
+from commands import selected_solids
 
 _DIEL_ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "DielectricGroup.svg")
 _COND_ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "ConductorGroup.svg")
-
-
-def _selected_solids():
-    solids = []
-    for sel in FreeCADGui.Selection.getSelection():
-        if hasattr(sel, "Shape"):
-            solids.append(sel)
-    return solids
 
 
 class CmdDielectricGroup:
@@ -28,7 +21,7 @@ class CmdDielectricGroup:
 
     def Activated(self):
         doc = FreeCAD.ActiveDocument
-        solids = _selected_solids()
+        solids = selected_solids()
 
         from features.material_group import create_dielectric_group
         from panels.material_group_panel import DielectricGroupPanel
@@ -58,7 +51,7 @@ class CmdConductorGroup:
 
     def Activated(self):
         doc = FreeCAD.ActiveDocument
-        solids = _selected_solids()
+        solids = selected_solids()
 
         from features.material_group import create_conductor_group
         from panels.material_group_panel import ConductorGroupPanel

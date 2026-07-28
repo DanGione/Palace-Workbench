@@ -301,6 +301,20 @@ def create_impedance_boundary(doc, index=1, faces=None, edge_refs=None):
                 by_obj[key] = (ref_obj, [])
             by_obj[key][1].append(sub)
         obj.PortEdges = [(ref_obj, subs) for ref_obj, subs in by_obj.values()]
+
+        # Direction defaults to "+R" (radial, for annular/coaxial geometry) --
+        # for a planar boundary that's invalid and silently zeroes _compute_ar(),
+        # so Rs/Ls/Cs never get derived from R/L/C. Auto-detect the major axis
+        # for planar edge pairs instead; leave annular ones at "+R".
+        try:
+            e1 = edge_refs[0][0].Shape.getElement(edge_refs[0][1])
+            e2 = edge_refs[1][0].Shape.getElement(edge_refs[1][1])
+            from palace.port_geometry import classify_edge_pair, detect_axis_direction
+            kind, _, _ = classify_edge_pair(e1, e2)
+            if kind == "planar":
+                obj.Direction = detect_axis_direction(e1, e2)
+        except Exception:
+            pass
     elif faces:
         obj.PortFaces = faces
 

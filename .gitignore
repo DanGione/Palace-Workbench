@@ -17,6 +17,8 @@ Microstrip_test_new_patched.FCStd
 Filter_2p6G.FCStd
 Wilkinson.FCStd
 Splitter.FCStd
+smd_prototype.FCStd
 BUGFIX_PLAN.md
+SMD_COMPONENT_GUI_PLAN.md
 .DS_Store
 Thumbs.db

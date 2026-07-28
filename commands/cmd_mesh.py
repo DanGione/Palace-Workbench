@@ -1,6 +1,7 @@
 import FreeCAD
 import FreeCADGui
 import os
+import shutil
 import time
 import traceback
 
@@ -24,8 +25,8 @@ def _fmt_elapsed(secs):
 class _MeshWorker(QThread):
     """Runs generate_mesh in a background thread."""
 
-    log = Signal(str)         # progress messages (marshaled to main thread)
-    done = Signal(bool, str)  # (success, mesh_path_or_traceback)
+    log = Signal(str)            # progress messages (marshaled to main thread)
+    done = Signal(bool, object)  # success: (mesh_path, geometry_path, quality); failure: traceback str
 
     def __init__(self, doc, output_dir, gmsh_instance, parent=None):
         super().__init__(parent)
@@ -36,12 +37,12 @@ class _MeshWorker(QThread):
     def run(self):
         from palace.meshing import generate_mesh
         try:
-            path = generate_mesh(
+            mesh_path, geometry_path, quality = generate_mesh(
                 self._doc, self._output_dir,
                 log_fn=self.log.emit,
                 _gmsh_instance=self._gmsh,
             )
-            self.done.emit(True, path)
+            self.done.emit(True, (mesh_path, geometry_path, quality))
         except Exception:
             self.done.emit(False, traceback.format_exc())
 
@@ -74,9 +75,8 @@ class CmdMesh:
 
     def Activated(self):
         doc = FreeCAD.ActiveDocument
-        from commands.cmd_run import _output_dir
-        out_dir = _output_dir(doc)
-        os.makedirs(out_dir, exist_ok=True)
+        from palace.embedded_files import new_scratch_dir
+        mesh_dir = new_scratch_dir(doc, "mesh")
 
         # Ensure a PalaceMesh object exists to receive the result.
         from features.mesh import create_palace_mesh
@@ -112,20 +112,43 @@ class CmdMesh:
         def _on_done(ok, result):
             CmdMesh._worker = None
             if ok:
-                mesh_obj.MeshFile = result
+                mesh_path, geometry_path, quality = result
+                if quality.get("is_bad"):
+                    from palace.meshing import format_quality_warning
+                    reply = QtWidgets.QMessageBox.question(
+                        None, "Low-Quality Mesh",
+                        f"{format_quality_warning(quality)}\n\nKeep this mesh?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No,
+                    )
+                    if reply != QtWidgets.QMessageBox.Yes:
+                        _log("Palace: Mesh discarded (quality check declined).\n")
+                        shutil.rmtree(mesh_dir, ignore_errors=True)
+                        if console is not None:
+                            console.set_status("Mesh discarded (low quality)")
+                        return
+                from palace.embedded_files import embed
+                embed(mesh_obj, "MeshFile", mesh_path, "mesh.msh")
+                embed(mesh_obj, "GeometryFile", geometry_path, "geometry.step")
+                # embed() copies rather than consumes a source living in a
+                # subdirectory of the transient dir -- mesh_dir must be cleaned
+                # up explicitly or it leaks on every "Generate Mesh" click.
+                shutil.rmtree(mesh_dir, ignore_errors=True)
                 try:
                     from features import find_simulation
                     sim = find_simulation(doc)
                     if sim:
-                        sim.MeshFile = result  # backward compat
+                        # Resolved (embedded, permanent) path, not the scratch mesh_path
+                        # that mesh_dir's rmtree above just deleted -- backward compat.
+                        sim.MeshFile = mesh_obj.MeshFile
                 except Exception:
                     pass
-                # Call execute() directly — setting a PropertyString doesn't
+                # Call execute() directly — setting a PropertyFileIncluded doesn't
                 # reliably mark Mesh::FeaturePython dirty before doc.recompute().
                 mesh_obj.Proxy.execute(mesh_obj)
                 doc.recompute()
                 elapsed = _fmt_elapsed(time.time() - _t0_mesh)
-                _log(f"Palace: Mesh written to {result}\n")
+                _log(f"Palace: Mesh written to {mesh_path}\n")
                 _log(f"Palace: Mesh generated in {elapsed}\n")
                 if console is not None:
                     console.set_status(f"Mesh complete ({elapsed})")
@@ -139,7 +162,7 @@ class CmdMesh:
                 )
 
         _log("Palace: Generating mesh…\n")
-        CmdMesh._worker = _MeshWorker(doc, out_dir, gmsh_instance)
+        CmdMesh._worker = _MeshWorker(doc, mesh_dir, gmsh_instance)
         CmdMesh._worker.log.connect(_log)
         CmdMesh._worker.done.connect(_on_done)
         CmdMesh._worker.start()

@@ -6,72 +6,21 @@ try:
 except ImportError:
     from PySide6 import QtWidgets, QtCore
 
+from panels.unit_widgets import (
+    R_UNITS as _R_UNITS, L_UNITS as _L_UNITS, C_UNITS as _C_UNITS,
+    set_unit_field as _set_unit_field, read_si_field as _read_si_field,
+    rescale_on_unit_change as _rescale_on_unit_change, make_unit_row as _make_unit_row,
+)
+
 _ALL_DIRECTIONS = ["+R", "-R", "X", "-X", "Y", "-Y", "Z", "-Z"]
 
 # ---------------------------------------------------------------------------
-# Unit sets — (display_label, SI_scale)   SI_value = display_value × SI_scale
+# "Per square" unit sets are only used in this file (Rs/Ls/Cs surface-mode
+# fields), so they stay local rather than moving into panels/unit_widgets.py.
 # ---------------------------------------------------------------------------
-_R_UNITS  = [("Ω",     1.0),  ("mΩ",     1e-3), ("kΩ",     1e3)]
-_L_UNITS  = [("H",     1.0),  ("mH",     1e-3), ("μH",     1e-6), ("nH",     1e-9), ("pH",     1e-12)]
-_C_UNITS  = [("F",     1.0),  ("mF",     1e-3), ("μF",     1e-6), ("nF",     1e-9), ("pF",     1e-12)]
 _RS_UNITS = [("Ω/sq",  1.0),  ("mΩ/sq",  1e-3), ("kΩ/sq",  1e3)]
 _LS_UNITS = [("H/sq",  1.0),  ("mH/sq",  1e-3), ("μH/sq",  1e-6), ("nH/sq",  1e-9), ("pH/sq",  1e-12)]
 _CS_UNITS = [("F/sq",  1.0),  ("mF/sq",  1e-3), ("μF/sq",  1e-6), ("nF/sq",  1e-9), ("pF/sq",  1e-12)]
-
-
-def _best_unit_idx(si_value, units):
-    """Return the index of the most readable unit for si_value."""
-    if si_value == 0.0:
-        return 0
-    for i, (_, scale) in enumerate(units):
-        if 0.1 <= abs(si_value) / scale < 1000:
-            return i
-    return 0
-
-
-def _set_unit_field(edit, combo, si_value, units):
-    """Populate edit+combo from a SI value, choosing the best unit."""
-    idx = _best_unit_idx(si_value, units)
-    combo.blockSignals(True)
-    combo.setCurrentIndex(idx)
-    combo.setProperty("_prev_idx", idx)
-    combo.blockSignals(False)
-    edit.setText(f"{si_value / units[idx][1]:.6g}")
-
-
-def _read_si_field(edit, combo, units, fallback):
-    """Read the SI value from edit+combo; return fallback on invalid input."""
-    try:
-        return float(edit.text()) * units[combo.currentIndex()][1]
-    except ValueError:
-        return fallback
-
-
-def _rescale_on_unit_change(edit, combo, units, new_idx):
-    """Re-scale the displayed value when the unit selection changes."""
-    prev_idx = combo.property("_prev_idx")
-    if prev_idx is None:
-        prev_idx = 0
-    try:
-        si = float(edit.text()) * units[prev_idx][1]
-    except (ValueError, TypeError):
-        si = 0.0
-    combo.setProperty("_prev_idx", new_idx)
-    edit.setText(f"{si / units[new_idx][1]:.6g}")
-
-
-def _make_unit_row(edit, combo, units):
-    """Return a QWidget containing edit + unit combo side by side."""
-    for name, _ in units:
-        combo.addItem(name)
-    combo.setFixedWidth(80)
-    w = QtWidgets.QWidget()
-    lay = QtWidgets.QHBoxLayout(w)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(4)
-    lay.addWidget(edit)
-    lay.addWidget(combo)
-    return w
 
 
 def _detect_face_geometry(faces):
@@ -393,8 +342,7 @@ class ImpedanceBoundaryPanel:
 
     def getStandardButtons(self):
         try:
-            from PySide2.QtWidgets import QDialogButtonBox
-            return int(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        except ImportError:
-            from PySide6.QtWidgets import QDialogButtonBox
-            return QDialogButtonBox.Ok.value | QDialogButtonBox.Cancel.value
+            return int(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        except TypeError:
+            return (QtWidgets.QDialogButtonBox.Ok.value
+                    | QtWidgets.QDialogButtonBox.Cancel.value)

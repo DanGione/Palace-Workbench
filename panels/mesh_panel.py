@@ -163,7 +163,11 @@ class MeshPanel:
     def _refresh_status(self):
         mesh_file = getattr(self.obj, "MeshFile", "")
         if mesh_file and os.path.isfile(mesh_file):
-            self.lbl_file.setText(mesh_file)
+            # mesh_file is now embedded (resolves to a FreeCAD-internal cache
+            # path, not anywhere user-visible) -- show the basename and put
+            # the real path in a tooltip, matching s_param_panel.py's _file_label.
+            self.lbl_file.setText(os.path.basename(mesh_file))
+            self.lbl_file.setToolTip(mesh_file)
             self.lbl_size.setText(_fmt_size(mesh_file))
             n_nodes, n_elements = _read_mesh_stats(mesh_file)
             if n_nodes is not None:
@@ -172,6 +176,7 @@ class MeshPanel:
                 self.lbl_stats.setText("—")
         else:
             self.lbl_file.setText("Not generated")
+            self.lbl_file.setToolTip("")
             self.lbl_size.setText("—")
             self.lbl_stats.setText("—")
 
@@ -300,8 +305,7 @@ class MeshPanel:
 
     def getStandardButtons(self):
         try:
-            from PySide2.QtWidgets import QDialogButtonBox
-            return int(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        except ImportError:
-            from PySide6.QtWidgets import QDialogButtonBox
-            return QDialogButtonBox.Ok.value | QDialogButtonBox.Cancel.value
+            return int(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        except TypeError:
+            return (QtWidgets.QDialogButtonBox.Ok.value
+                    | QtWidgets.QDialogButtonBox.Cancel.value)

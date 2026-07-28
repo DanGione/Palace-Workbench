@@ -17,6 +17,13 @@ _ANG_RE = re.compile(r"arg\(S\[(\d+)\]\[(\d+)\]\)")
 # Matches "Re{E_x[N]}" / "Im{B_y[N]}" etc. in probe-E.csv / probe-B.csv
 _RE_PROBE = re.compile(r"Re\{([EB])_([xyz])\[(\d+)\]\}")
 _IM_PROBE = re.compile(r"Im\{([EB])_([xyz])\[(\d+)\]\}")
+# Matches "Re{Z_PV[N]} (Ohm)" / "Im{Z_PV[N]} (Ohm)" in port-Z.csv -- the
+# excitation-independent wave-port mode characteristic impedance written by
+# Palace >=0.17.0 when a WavePort has VoltagePath set.  Deliberately does NOT
+# match the visually similar "Re{Z[N][ex]} (Ohm)" pair (per-excitation input
+# impedance looking into the port -- a different physical quantity).
+_ZPV_RE = re.compile(r"Re\{Z_PV\[(\d+)\]\}")
+_ZPV_IM = re.compile(r"Im\{Z_PV\[(\d+)\]\}")
 
 
 def parse_probe_csv(path):
@@ -57,48 +64,40 @@ def parse_probe_csv(path):
     return freq_ghz, data
 
 
-def compute_wave_port_impedance(e_data, b_data, probe_indices, probe_positions_mm,
-                                grid_probe_indices, grid_probe_positions_mm,
-                                port_normal=(0.0, 0.0, 1.0)):
-    """Compute characteristic impedance from E and B probe data.
+def compute_te_tm_impedance(e_data, b_data, grid_probe_indices, grid_probe_positions_mm,
+                             port_normal=(0.0, 0.0, 1.0)):
+    """Compute TE/TM wave impedance from E and B probe data via Poynting flux.
 
-    Two paths are selected automatically based on whether V-line probes are present:
+    For hollow single-conductor waveguide ports (no IntegrationEdge, so no
+    natural signal/ground conductor pair) -- Palace's native VoltagePath/Z_PV
+    postprocessing doesn't apply here (it's a signal-to-ground line integral),
+    so this manual grid-probe calculation is retained as the only option:
 
-    **Quasi-TEM** (len(probe_indices) >= 2 — IntegrationEdge was set):
-        Z₀^{VI} = |V| / |I|  (voltage-current definition, engineering convention)
-        V = trapezoidal ∫E·dl along the probe edge (inner → outer conductor).
-        I = (Δu/μ₀) × Σ_cols [B_h(z_below) − B_h(z_above)]  via Ampere contour
-        straddling the inner conductor height. B_h is the horizontal B component on
-        the port face (the span axis that is neither the V-integration axis nor the
-        port normal).
-
-    **TE / TM** (len(probe_indices) == 0 — no IntegrationEdge, hollow waveguide):
         Z_w = μ₀ Σ|E_t|² / Σ Re(E×B*·n̂)  over 2-D grid probes.
-        For a single TE mode this gives Z_TE = ωμ₀/β exactly; for TM, Z_TM = βη²/(ωμ₀).
+
+    For a single TE mode this gives Z_TE = ωμ₀/β exactly; for TM, Z_TM = βη²/(ωμ₀).
+
+    For ports that DO have an IntegrationEdge (quasi-TEM, e.g. coax/microstrip/
+    CPW), use parse_wave_port_z_csv() instead to read Palace's own natively
+    computed Z_PV from port-Z.csv -- Palace performs this line integral itself
+    (GSLIB-cached) against the actual field solution, which this module no
+    longer reimplements.
 
     Parameters
     ----------
     e_data                  : {probe_idx: {comp: [complex]}} from parse_probe_csv(probe-E.csv)
     b_data                  : {probe_idx: {comp: [complex]}} from parse_probe_csv(probe-B.csv)
-    probe_indices           : list[int] — V-line probe indices (inner→outer conductor); [] for TE/TM
-    probe_positions_mm      : list[(x,y,z)] — V-line probe coordinates in mm; [] for TE/TM
     grid_probe_indices      : list[int] — 2-D grid probe indices covering the port face
     grid_probe_positions_mm : list[(x,y,z)] — grid probe coordinates in mm (same order)
     port_normal             : (x,y,z) unit vector normal to the port face (propagation direction)
 
-    Returns list[float] of Z per frequency, or [] if data is unavailable.
+    Returns list[complex] of Z per frequency, or [] if data is unavailable.
     """
     if not _NP_OK:
         raise ImportError("numpy is required for characteristic impedance extraction")
 
     MU0 = 4.0 * _np.pi * 1e-7
-    L0  = 1e-3   # mm → metres
 
-    n_probes = len(probe_indices)
-    use_vi = (n_probes >= 2)
-    use_zw = (n_probes == 0 and bool(grid_probe_indices))
-    if not use_vi and not use_zw:
-        return []
     if not grid_probe_indices or not grid_probe_positions_mm:
         return []
 
@@ -106,78 +105,8 @@ def compute_wave_port_impedance(e_data, b_data, probe_indices, probe_positions_m
     n_hat /= (_np.linalg.norm(n_hat) or 1.0)
     nx, ny, nz = float(n_hat[0]), float(n_hat[1]), float(n_hat[2])
 
-    _src   = probe_indices[0] if use_vi else grid_probe_indices[0]
-    n_freq = len(next(iter(e_data[_src].values())))
+    n_freq = len(next(iter(e_data[grid_probe_indices[0]].values())))
 
-    # ------------------------------------------------------------------ #
-    # Quasi-TEM: Z₀^{VI} = |V| / |I|  via Ampere contour                #
-    # ------------------------------------------------------------------ #
-    if use_vi:
-        for idx in probe_indices:
-            if idx not in e_data:
-                return []
-
-        pts_arr     = _np.array(probe_positions_mm, dtype=float)
-        axis_ranges = pts_arr.max(axis=0) - pts_arr.min(axis=0)
-        vert_ax  = int(_np.argmax(axis_ranges))
-        norm_ax  = int(_np.argmax(_np.abs(n_hat)))
-        horiz_ax = [i for i in range(3) if i != vert_ax and i != norm_ax][0]
-        bcomp    = ('Bx', 'By', 'Bz')[horiz_ax]
-
-        grid_pos = _np.array(grid_probe_positions_mm, dtype=float)
-        h_vals   = sorted(set(_np.round(grid_pos[:, horiz_ax], 6).tolist()))
-        v_vals   = sorted(set(_np.round(grid_pos[:, vert_ax],  6).tolist()))
-        if len(h_vals) < 2:
-            return []
-        du_m = (h_vals[1] - h_vals[0]) * L0
-
-        z_inner = float(pts_arr[0, vert_ax])
-        below_v = [v for v in v_vals if v < z_inner - 1e-6]
-        above_v = [v for v in v_vals if v > z_inner + 1e-6]
-        if not below_v or not above_v:
-            return []
-        z_below, z_above = max(below_v), min(above_v)
-
-        idx_map = {(round(float(pos[horiz_ax]), 4), round(float(pos[vert_ax]), 4)): idx
-                   for idx, pos in zip(grid_probe_indices, grid_probe_positions_mm)}
-        below_ids = [idx_map[(round(h, 4), round(z_below, 4))] for h in h_vals
-                     if (round(h, 4), round(z_below, 4)) in idx_map]
-        above_ids = [idx_map[(round(h, 4), round(z_above, 4))] for h in h_vals
-                     if (round(h, 4), round(z_above, 4)) in idx_map]
-        if not below_ids or not above_ids:
-            return []
-        for idx in below_ids + above_ids:
-            if idx not in b_data:
-                return []
-
-        pts = _np.array(probe_positions_mm, dtype=float)
-        z_c = []
-        for fi in range(n_freq):
-            V = complex(0)
-            for k in range(n_probes - 1):
-                dl_m   = (pts[k + 1] - pts[k]) * L0
-                idx_k  = probe_indices[k]
-                idx_k1 = probe_indices[k + 1]
-                E_k  = _np.array([e_data[idx_k].get( 'Ex', [0]*n_freq)[fi],
-                                   e_data[idx_k].get( 'Ey', [0]*n_freq)[fi],
-                                   e_data[idx_k].get( 'Ez', [0]*n_freq)[fi]])
-                E_k1 = _np.array([e_data[idx_k1].get('Ex', [0]*n_freq)[fi],
-                                   e_data[idx_k1].get('Ey', [0]*n_freq)[fi],
-                                   e_data[idx_k1].get('Ez', [0]*n_freq)[fi]])
-                V += _np.dot(0.5 * (E_k + E_k1), dl_m)
-
-            I_val = (sum(b_data[i].get(bcomp, [0]*n_freq)[fi] for i in below_ids) -
-                     sum(b_data[i].get(bcomp, [0]*n_freq)[fi] for i in above_ids))
-            I_val = I_val * du_m / MU0
-            if abs(I_val) < 1e-15:
-                z_c.append(complex(0))
-                continue
-            z_c.append(abs(V) / abs(I_val))
-        return z_c
-
-    # ------------------------------------------------------------------ #
-    # TE / TM: Z_w = μ₀ Σ|E_t|² / Σ Re(E×B*·n̂)                        #
-    # ------------------------------------------------------------------ #
     for idx in grid_probe_indices:
         if idx not in e_data or idx not in b_data:
             return []
@@ -205,6 +134,47 @@ def compute_wave_port_impedance(e_data, b_data, probe_indices, probe_positions_m
             continue
         z_c.append(MU0 * E_t_sq_sum / cross_sum)
     return z_c
+
+
+def parse_wave_port_z_csv(path):
+    """Parse a Palace port-Z.csv (Palace >=0.17.0).
+
+    Palace writes this file when at least one WavePort has VoltagePath set,
+    with an excitation-independent "Re{Z_PV[idx]} (Ohm)" / "Im{Z_PV[idx]} (Ohm)"
+    column pair per such port -- the mode characteristic impedance computed
+    natively from the field solution.  The file may also contain a visually
+    similar but physically different per-excitation "Re{Z[idx][ex]} (Ohm)"
+    pair (input impedance looking into the port); this parser only reads the
+    Z_PV columns.
+
+    Returns (freq_ghz, data) where data[port_idx] = list[complex], one entry
+    per frequency.
+    """
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        headers = [h.strip() for h in next(reader)]
+        rows = [[float(v) for v in r] for r in reader if any(v.strip() for v in r)]
+
+    re_cols = {}
+    im_cols = {}
+    for i, h in enumerate(headers):
+        m = _ZPV_RE.search(h)
+        if m:
+            re_cols[int(m.group(1))] = i
+            continue
+        m = _ZPV_IM.search(h)
+        if m:
+            im_cols[int(m.group(1))] = i
+
+    freq_ghz = [r[0] for r in rows]
+    data = {}
+    for idx, ri in re_cols.items():
+        ii = im_cols.get(idx)
+        if ii is None:
+            continue
+        data[idx] = [complex(r[ri], r[ii]) for r in rows]
+
+    return freq_ghz, data
 
 
 def _parse_s_csv(path):
@@ -235,29 +205,8 @@ def _parse_s_csv(path):
     return freq_ghz, mag_db, phase_deg
 
 
-def renormalize_s_matrix(s_csv_path, port_z_old, port_z_new):
-    """Renormalize S-matrix from per-port reference impedances to new target impedances.
-
-    Applies the power-wave bilinear S→Z→S transform:
-        Z_mat  = D_old @ (I + S) @ inv(I - S) @ D_old
-        S_new  = D_new⁻¹ @ (Z_mat - T_new) @ inv(Z_mat + T_new) @ D_new
-    where D_old = diag(sqrt(Z_old)), T_new = diag(Z_new).
-
-    Parameters
-    ----------
-    s_csv_path : path to Palace port-S.csv
-    port_z_old : {port_idx: float} — reference impedances S-params were computed at
-    port_z_new : {port_idx: float} — target normalization impedances
-    Ports absent from either dict default to 50 Ω.
-
-    Returns (freq_ghz, renorm_mag_db, renorm_phase_deg) with the same dict-of-lists
-    structure as _parse_s_csv, ready for the S-param viewer.
-    """
-    if not _NP_OK:
-        raise ImportError("numpy is required for S-parameter renormalization")
-
-    freq_ghz, mag_db, phase_deg = _parse_s_csv(s_csv_path)
-
+def _renormalize_data(freq_ghz, mag_db, phase_deg, port_z_old, port_z_new):
+    """Inner renormalization logic (operates on in-memory arrays)."""
     keys      = sorted(mag_db)
     all_ports = sorted(set(r for r, c in keys) | set(c for r, c in keys))
     n_ports   = len(all_ports)
@@ -292,6 +241,41 @@ def renormalize_s_matrix(s_csv_path, port_z_old, port_z_new):
             s_new_phase[(r, c)].append(float(_np.rad2deg(_np.angle(val))))
 
     return freq_ghz, s_new_mag, s_new_phase
+
+
+def renormalize_s_matrix(s_csv_path, port_z_old, port_z_new):
+    """Renormalize S-matrix from per-port reference impedances to new target impedances.
+
+    Applies the power-wave bilinear S→Z→S transform:
+        Z_mat  = D_old @ (I + S) @ inv(I - S) @ D_old
+        S_new  = D_new⁻¹ @ (Z_mat - T_new) @ inv(Z_mat + T_new) @ D_new
+    where D_old = diag(sqrt(Z_old)), T_new = diag(Z_new).
+
+    Parameters
+    ----------
+    s_csv_path : path to Palace port-S.csv
+    port_z_old : {port_idx: float} — reference impedances S-params were computed at
+    port_z_new : {port_idx: float} — target normalization impedances
+    Ports absent from either dict default to 50 Ω.
+
+    Returns (freq_ghz, renorm_mag_db, renorm_phase_deg) with the same dict-of-lists
+    structure as _parse_s_csv, ready for the S-param viewer.
+    """
+    if not _NP_OK:
+        raise ImportError("numpy is required for S-parameter renormalization")
+    freq_ghz, mag_db, phase_deg = _parse_s_csv(s_csv_path)
+    return _renormalize_data(freq_ghz, mag_db, phase_deg, port_z_old, port_z_new)
+
+
+def renormalize_s_matrix_from_data(freq_ghz, mag_db, phase_deg, port_z_old, port_z_new):
+    """Renormalize S-matrix from in-memory arrays (no CSV read).
+
+    Same transform and return format as renormalize_s_matrix, but accepts
+    already-parsed data directly (e.g. loaded from a results .nc file).
+    """
+    if not _NP_OK:
+        raise ImportError("numpy is required for S-parameter renormalization")
+    return _renormalize_data(freq_ghz, mag_db, phase_deg, port_z_old, port_z_new)
 
 
 def merge_s_matrix(pass_output_dirs, output_path):

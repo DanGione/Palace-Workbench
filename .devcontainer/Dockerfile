@@ -44,8 +44,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Miniconda ────────────────────────────────────────────────────────────────
+# Pinned to a py312 build (not "latest") because conda-forge's freecad=1.0.0
+# has no build past Python 3.13 — "latest" drifts forward (now py314) and
+# breaks the freecad install below with an unsatisfiable-environment error.
 ENV CONDA_DIR=/opt/conda
-RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-py312_26.5.3-1-Linux-x86_64.sh \
         -O /tmp/miniconda.sh \
     && bash /tmp/miniconda.sh -b -p ${CONDA_DIR} \
     && rm /tmp/miniconda.sh \
@@ -58,14 +61,17 @@ RUN conda install -y -c conda-forge --override-channels "freecad=1.0.0" \
     && conda clean -afy
 
 # ── gmsh (Python API + CLI) ──────────────────────────────────────────────────
-RUN pip install --no-cache-dir gmsh numpy scipy cmake matplotlib
+RUN pip install --no-cache-dir gmsh numpy scipy cmake matplotlib xarray netCDF4
 
-# ── Palace (AWSLabs) — latest source from GitHub ─────────────────────────────
+# ── Palace (AWSLabs) — pinned release from GitHub ─────────────────────────────
 # Palace ships a CMake superbuild that downloads and compiles all of its own
 # dependencies (MFEM, HYPRE, libCEED, SuperLU_DIST, nlohmann/json, fmt, …).
 # Only system-level MPI, BLAS/LAPACK, and zlib are consumed from the OS.
 # The source tree is deleted after installation to keep the image lean.
-RUN git clone --depth=1 https://github.com/awslabs/palace.git /tmp/palace-src \
+# Pinned to v0.17.0 (latest tagged release as of writing) instead of tracking
+# main — an unpinned clone silently picks up whatever's newest upstream on
+# every image rebuild, making builds non-reproducible and liable to break.
+RUN git clone --depth=1 --branch v0.17.0 https://github.com/awslabs/palace.git /tmp/palace-src \
     && cmake -S /tmp/palace-src -B /tmp/palace-src/build \
              -DCMAKE_BUILD_TYPE=Release \
              -DCMAKE_INSTALL_PREFIX=/usr/local \

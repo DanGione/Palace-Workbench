@@ -50,8 +50,18 @@ class SimulationContainer:
              "Full path to the Palace executable", "/usr/local/bin/palace")
         _add(obj, "App::PropertyString", "MeshFile", "Palace",
              "Path to the generated Gmsh mesh file (set automatically)", "")
+        _add(obj, "App::PropertyFileIncluded", "ResultsFile", "Palace",
+             "Embedded results NetCDF4 file for the last single Run (generated automatically)", "")
+        _add(obj, "App::PropertyFileIncluded", "ConfigFile", "Palace",
+             "Embedded Palace JSON config for the last single Run (generated automatically)", "")
         _add(obj, "App::PropertyString", "SParamSelection", "Palace",
              "JSON list of [row,col] S-parameter keys selected in the viewer", "")
+        _add(obj, "App::PropertyString", "AvailableSParams", "Palace",
+             "JSON list of [[row,col],...] S-param pairs available given current port Excitation "
+             "settings (auto-updated on recompute).", "[]")
+        _add(obj, "App::PropertyBool", "SParamRenormActive", "Palace",
+             "Whether the S-Parameter panel's renormalization is applied — persisted so it "
+             "survives document close/reopen and simulation re-runs.", False)
 
         # Mesh sizing
         _add(obj, "App::PropertyFloat", "MeshCharacteristicLengthMax", "Mesh",
@@ -97,7 +107,13 @@ class SimulationContainer:
              "Solver tolerance", 1e-8)
 
     def execute(self, obj):
-        pass
+        import json
+        try:
+            from features import get_available_s_params
+            pairs = get_available_s_params(obj.Document)
+            obj.AvailableSParams = json.dumps([[r, c] for r, c in pairs])
+        except Exception:
+            pass
 
     def onChanged(self, obj, prop):
         pass
@@ -105,6 +121,17 @@ class SimulationContainer:
     def onDocumentRestored(self, obj):
         self._init_properties(obj)
         self._migrate_to_group(obj)
+        from palace.embedded_files import migrate_legacy_string_property, legacy_sibling_path
+        migrate_legacy_string_property(
+            obj, "ResultsFile", "Palace",
+            "Embedded results NetCDF4 file for the last single Run (generated automatically)",
+            legacy_hint=legacy_sibling_path(obj.Document, "results.nc"),
+        )
+        migrate_legacy_string_property(
+            obj, "ConfigFile", "Palace",
+            "Embedded Palace JSON config for the last single Run (generated automatically)",
+            legacy_hint=legacy_sibling_path(obj.Document, "palace_config.json"),
+        )
         if FreeCAD.GuiUp and obj.ViewObject is not None:
             try:
                 obj.ViewObject.removeExtension("Gui::ViewProviderGroupExtensionPython", None)

@@ -48,10 +48,19 @@ class WavePortPanel:
 
         self.lbl_char_z = QtWidgets.QLabel("50.00 Ω")
         self.lbl_char_z.setToolTip(
-            "Characteristic impedance extracted from the field solution — "
+            "Characteristic impedance magnitude, mean of |Z| across frequency — "
+            "Palace's native Z_PV (from VoltagePath) when an Integration edge "
+            "is set, otherwise the TE/TM Poynting-flux impedance — "
             "auto-updated after each simulation run"
         )
-        fl.addRow("Characteristic Z:", self.lbl_char_z)
+        fl.addRow("Characteristic |Z|:", self.lbl_char_z)
+
+        self.lbl_char_z_complex = QtWidgets.QLabel("50.00 + j0.00 Ω")
+        self.lbl_char_z_complex.setToolTip(
+            "Characteristic impedance as a complex number (mean of Re(Z)/Im(Z) "
+            "across frequency) — auto-updated after each simulation run"
+        )
+        fl.addRow("Characteristic Z:", self.lbl_char_z_complex)
 
         self.spin_renorm_z = QtWidgets.QDoubleSpinBox()
         self.spin_renorm_z.setRange(0.01, 10000.0)
@@ -62,6 +71,50 @@ class WavePortPanel:
             "Target impedance for S-parameter renormalization — set by user"
         )
         fl.addRow("Renorm target Z:", self.spin_renorm_z)
+
+        adv_label = QtWidgets.QLabel("<b>Advanced (Solver)</b>")
+        fl.addRow(adv_label)
+
+        self.spin_max_its = QtWidgets.QSpinBox()
+        self.spin_max_its.setRange(0, 10000)
+        self.spin_max_its.setSpecialValueText("Auto")
+        self.spin_max_its.setToolTip(
+            "Krylov solver max iterations for the wave port eigenmode/"
+            "voltage-path solve — 0 = Palace default"
+        )
+        fl.addRow("Max iterations:", self.spin_max_its)
+
+        self.spin_ksp_tol = QtWidgets.QDoubleSpinBox()
+        self.spin_ksp_tol.setRange(0.0, 1.0)
+        self.spin_ksp_tol.setDecimals(10)
+        self.spin_ksp_tol.setSpecialValueText("Auto")
+        self.spin_ksp_tol.setToolTip("Krylov solver tolerance — 0 = Palace default")
+        fl.addRow("KSP tolerance:", self.spin_ksp_tol)
+
+        self.spin_eigen_tol = QtWidgets.QDoubleSpinBox()
+        self.spin_eigen_tol.setRange(0.0, 1.0)
+        self.spin_eigen_tol.setDecimals(10)
+        self.spin_eigen_tol.setSpecialValueText("Auto")
+        self.spin_eigen_tol.setToolTip("Eigenmode solve tolerance — 0 = Palace default")
+        fl.addRow("Eigen tolerance:", self.spin_eigen_tol)
+
+        self.spin_nsamples = QtWidgets.QSpinBox()
+        self.spin_nsamples.setRange(0, 100000)
+        self.spin_nsamples.setSpecialValueText("Auto")
+        self.spin_nsamples.setToolTip(
+            "VoltagePath internal resampling resolution — 0 = Palace default (100)"
+        )
+        fl.addRow("Voltage path samples:", self.spin_nsamples)
+
+        self.spin_offset = QtWidgets.QDoubleSpinBox()
+        self.spin_offset.setRange(0.0, 100000.0)
+        self.spin_offset.setDecimals(4)
+        self.spin_offset.setSuffix(" mm")
+        self.spin_offset.setSpecialValueText("Auto")
+        self.spin_offset.setToolTip(
+            "Port mode profile distance offset — 0 = Palace default"
+        )
+        fl.addRow("Mode offset:", self.spin_offset)
 
         return w
 
@@ -84,8 +137,19 @@ class WavePortPanel:
         char_z = getattr(o, "CharacteristicZ", 50.0)
         self.lbl_char_z.setText(f"{char_z:.2f} Ω")
 
+        char_z_re = getattr(o, "CharacteristicZReal", 50.0)
+        char_z_im = getattr(o, "CharacteristicZImag", 0.0)
+        sign = "+" if char_z_im >= 0 else "-"
+        self.lbl_char_z_complex.setText(f"{char_z_re:.2f} {sign} j{abs(char_z_im):.2f} Ω")
+
         renorm_z = getattr(o, "RenormZ", 50.0)
         self.spin_renorm_z.setValue(renorm_z)
+
+        self.spin_max_its.setValue(getattr(o, "MaxIts", 0))
+        self.spin_ksp_tol.setValue(getattr(o, "KSPTol", 0.0))
+        self.spin_eigen_tol.setValue(getattr(o, "EigenTol", 0.0))
+        self.spin_nsamples.setValue(getattr(o, "NSamples", 0))
+        self.spin_offset.setValue(getattr(o, "Offset", 0.0))
 
     def _refresh_face_label(self):
         n = sum(len(subs) for _, subs in self.faces)
@@ -132,6 +196,11 @@ class WavePortPanel:
         o.NumModes   = self.spin_modes.value()
         o.Excitation = self.chk_excite.isChecked()
         o.RenormZ    = self.spin_renorm_z.value()
+        o.MaxIts     = self.spin_max_its.value()
+        o.KSPTol     = self.spin_ksp_tol.value()
+        o.EigenTol   = self.spin_eigen_tol.value()
+        o.NSamples   = self.spin_nsamples.value()
+        o.Offset     = self.spin_offset.value()
         if self.edge_ref is not None:
             link_obj, sub_name = self.edge_ref
             o.IntegrationEdge = (link_obj, [sub_name])
@@ -147,8 +216,7 @@ class WavePortPanel:
 
     def getStandardButtons(self):
         try:
-            from PySide2.QtWidgets import QDialogButtonBox
-            return int(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        except ImportError:
-            from PySide6.QtWidgets import QDialogButtonBox
-            return QDialogButtonBox.Ok.value | QDialogButtonBox.Cancel.value
+            return int(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        except TypeError:
+            return (QtWidgets.QDialogButtonBox.Ok.value
+                    | QtWidgets.QDialogButtonBox.Cancel.value)

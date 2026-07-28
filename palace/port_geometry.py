@@ -35,6 +35,18 @@ def classify_edge_pair(edge1, edge2):
     return "planar", edge2, edge1
 
 
+def detect_axis_direction(edge1, edge2):
+    """Return the Cartesian Direction enum value whose axis best matches the
+    vector from edge1's to edge2's midpoint -- i.e. the major axis of a
+    planar port/impedance-boundary edge pair (edge1 as the starting point,
+    edge2 as the ending point). Returns 'X', '-X', 'Y', '-Y', 'Z', or '-Z'.
+    """
+    vec = edge2.CenterOfMass - edge1.CenterOfMass
+    components = {"X": vec.x, "Y": vec.y, "Z": vec.z}
+    axis = max(components, key=lambda k: abs(components[k]))
+    return axis if components[axis] >= 0 else f"-{axis}"
+
+
 def build_annular_face(outer_edge, inner_edge):
     """Build an annular (ring-shaped) face from outer and inner closed edges.
 

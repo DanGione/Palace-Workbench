@@ -212,7 +212,11 @@ def _collect_material_bodies(doc):
 
 def _match_vol_by_com(gmsh, solid, all_vol_tags):
     """Find the Gmsh volume whose bbox centre is closest to the FreeCAD solid's COM."""
-    com = solid.Shape.CenterOfMass   # FreeCAD.Vector in mm
+    # CenterOfGravity, not CenterOfMass: booleans (e.g. a dielectric with a cutout)
+    # commonly return Part.Compound wrapping a single solid, and Part.Compound has
+    # no CenterOfMass attribute at all -- CenterOfGravity exists on both and gives
+    # an identical (mass-weighted) result for a plain Solid.
+    com = solid.Shape.CenterOfGravity   # FreeCAD.Vector in mm
     target = (com.x, com.y, com.z)
     best_tag, best_d = None, float("inf")
     for tag in all_vol_tags:
@@ -288,14 +292,203 @@ def _assign_material_physical_groups(gmsh, log_fn,
                f"(attr {attr})\n")
 
 
+_OVERLAP_LOG_THRESHOLD = 1e-6   # mm^3 -- below this, treat as floating-point noise
+
+
+def _log_group_overlaps(grp, solids, log_fn):
+    """Warn about any pair of *solids* (a conductor group's children) whose
+    intersection has non-negligible volume.
+
+    Fusing (see _fuse_group_solids below) absorbs the boolean ambiguity of
+    an overlap either way, but a large or oddly-shaped overlap between very
+    different-sized solids (e.g. a complex connector housing dipping into a
+    thin ground plane) can still leave a thin, hard-to-mesh seam that the
+    fuse doesn't fully smooth out. This is purely diagnostic -- it changes
+    no geometry -- so this class of issue is a log line to read next time
+    instead of a manual gmsh investigation.
+    """
+    for i in range(len(solids)):
+        for j in range(i + 1, len(solids)):
+            a, b = solids[i], solids[j]
+            try:
+                overlap = a.Shape.common(b.Shape)
+            except Exception:
+                continue   # let the fuse step itself surface any real geometry error
+            if overlap.Volume <= _OVERLAP_LOG_THRESHOLD:
+                continue
+            bb = overlap.BoundBox
+            log_fn(
+                f"Palace: WARNING — conductor group '{grp.Label}' solids "
+                f"'{a.Label}' and '{b.Label}' overlap by {overlap.Volume:.4g} "
+                f"(bbox X[{bb.XMin:.3f},{bb.XMax:.3f}] Y[{bb.YMin:.3f},{bb.YMax:.3f}] "
+                f"Z[{bb.ZMin:.3f},{bb.ZMax:.3f}]). Fusing will absorb the boolean "
+                f"overlap, but a large or oddly-shaped overlap between very "
+                f"different-sized solids can still leave a thin, hard-to-mesh "
+                f"seam -- consider adjusting placement/clearance directly in the "
+                f"CAD model if mesh quality or convergence problems persist.\n"
+            )
+
+
+def format_quality_warning(quality):
+    """One-line human-readable summary of a _check_mesh_quality() result.
+
+    Shared by every GUI call site (cmd_mesh.py, cmd_run.py, cmd_sweep.py) so the
+    dialog/log text describing a bad mesh stays worded consistently in one place.
+    """
+    return (
+        f"{quality['n_bad']}/{quality['n_elements']} tetrahedra are below the quality "
+        f"threshold (worst = {quality['min_quality']:.4g}). Degenerate/sliver elements "
+        f"can cause Palace solver instability or inaccurate results."
+    )
+
+
+def _check_mesh_quality(gmsh, log_fn, threshold):
+    """Check the 3D tetrahedra Gmsh just generated for degenerate/sliver elements.
+
+    Uses Gmsh's own "minSICN" measure (signed inverse condition number: ~1.0 for an
+    equilateral tet, 0 for degenerate, negative for inverted) -- the same metric and
+    threshold validated empirically against a known-bad conductor group (a 50 micron
+    trace/ground-plane fused with a millimeter-scale connector body produced elements
+    below 0.1 quality; an appropriately sized mesh over the same geometry produced
+    none).
+
+    threshold <= 0 disables the check entirely (returns is_bad=False unconditionally)
+    -- some models may have an intentionally-accepted rough region.
+
+    Always logs a one-line result via log_fn, whether or not the mesh looks bad, so a
+    quiet pass is as visible in the log as a warning.
+    """
+    if threshold <= 0.0:
+        return {"min_quality": None, "n_elements": 0, "n_bad": 0,
+                "bad_fraction": 0.0, "is_bad": False}
+
+    _, tags, _ = gmsh.model.mesh.getElements(3)
+    quals = []
+    for t in tags:
+        if len(t) == 0:
+            continue
+        quals.extend(gmsh.model.mesh.getElementQualities(t, "minSICN"))
+
+    if not quals:
+        return {"min_quality": None, "n_elements": 0, "n_bad": 0,
+                "bad_fraction": 0.0, "is_bad": False}
+
+    n = len(quals)
+    min_q = min(quals)
+    n_bad = sum(1 for q in quals if q < threshold)
+    result = {
+        "min_quality": min_q,
+        "n_elements": n,
+        "n_bad": n_bad,
+        "bad_fraction": n_bad / n,
+        "is_bad": n_bad > 0,
+    }
+    if result["is_bad"]:
+        log_fn(
+            f"Palace: WARNING — mesh quality check found {n_bad}/{n} tetrahedra below "
+            f"quality {threshold:.3g} (worst = {min_q:.4g}, Gmsh minSICN). "
+            f"Degenerate/sliver elements can cause Palace solver instability or "
+            f"inaccurate results.\n"
+        )
+    else:
+        log_fn(f"Palace: Mesh quality check passed ({n} tetrahedra, worst = {min_q:.4g}).\n")
+    return result
+
+
+def _validate_shape(shape, label, log_fn):
+    """Best-effort repair + validity check for a solid before it enters Gmsh.
+
+    A class of MFEM aborts deep inside the Palace binary (STable3D face-table
+    lookup failures during mesh setup) trace back to boundary triangles that
+    don't close up with the volume mesh -- which in turn traces back to
+    BRep-level defects (most commonly BOPAlgo_InvalidCurveOnSurface: an edge's
+    3-D curve doesn't lie on its own face's surface within tolerance) already
+    present in the solid before Gmsh ever sees it. shape.fix() resolves the
+    cheaper cases; anything it can't fix is surfaced here as an early,
+    specific warning instead of an opaque abort after mesh generation and
+    launching the solver.
+
+    Non-blocking, like _check_mesh_quality: returns a shape either way
+    (repaired if fixable, the original otherwise) so one bad solid can't break
+    meshing entirely -- not every invalid-curve defect actually breaks the mesh.
+    """
+    try:
+        shape.check(True)
+        return shape
+    except Exception:
+        pass
+
+    repaired = shape.copy()
+    try:
+        repaired.fix(0.0001, 0.0, 0.1)
+        repaired.check(True)
+        log_fn(f"Palace: Repaired invalid geometry in '{label}' before meshing.\n")
+        return repaired
+    except Exception as exc:
+        log_fn(
+            f"Palace: WARNING — '{label}' has invalid geometry that automatic "
+            f"repair could not fix ({exc}). This is a known cause of an MFEM "
+            f"'STable3D' abort during Palace's mesh setup. Try FreeCAD's Part -> "
+            f"Check Geometry on this solid and rebuild the affected faces before "
+            f"running.\n"
+        )
+        return shape
+
+
+def _fuse_group_solids(grp, solids, log_fn):
+    """Fuse all of a conductor group's child *solids* into one shape.
+
+    Multiple solids sharing a conductor group commonly touch, or slightly
+    overlap, one another -- e.g. a hand-placed pin meeting a trace where the
+    two were modeled independently and don't align to floating-point
+    precision. Fusing them into a single shape before face export absorbs
+    any such overlap into the shape's interior instead of leaving a
+    razor-thin sliver face at the former boundary for Gmsh's fragment/mesh
+    steps to choke on -- a common source of inverted (negative-Jacobian)
+    tetrahedra right at that seam. removeSplitter() cleans up the redundant
+    coincident faces the fuse leaves behind at the now-interior boundary.
+
+    Solids that don't actually touch/overlap are unaffected: fuse() of
+    disjoint solids returns them as separate solids within one Compound, so
+    no geometry is gained or lost -- only genuinely coincident/overlapping
+    boundaries get simplified away.
+
+    Returns (shape, label). A single-solid group is returned unfused (label
+    is that solid's own Label, matching pre-fuse log output exactly). If the
+    fuse itself fails on pathological geometry, falls back to an un-fused
+    Compound of all the solids so one bad group can't break meshing
+    entirely -- this just reverts that group to the old per-solid behavior,
+    where any overlap between them may still confuse meshing.
+    """
+    import Part
+
+    if len(solids) == 1:
+        shape, label = solids[0].Shape, solids[0].Label
+    else:
+        _log_group_overlaps(grp, solids, log_fn)
+        try:
+            fused = solids[0].Shape.fuse([s.Shape for s in solids[1:]])
+            shape = fused.removeSplitter()
+            label = f"{grp.Label} ({len(solids)} solids fused)"
+        except Exception as exc:
+            log_fn(f"Palace: WARNING — could not fuse {len(solids)} solids in "
+                   f"conductor group '{grp.Label}': {exc}. Importing them "
+                   f"separately instead (any overlap between them may still "
+                   f"confuse meshing).\n")
+            shape, label = Part.makeCompound([s.Shape for s in solids]), grp.Label
+
+    return _validate_shape(shape, label, log_fn), label
+
+
 def _import_conductor_solid_faces(gmsh, cond_bodies, log_fn, skip_normals=None):
     """
-    For each conductor solid body, export every face as a BRep 2-D surface and
-    import it into Gmsh as a standalone OCC surface.
+    For each conductor group, fuse all its child solids into one shape (see
+    _fuse_group_solids) and export every face as a BRep 2-D surface, importing
+    it into Gmsh as a standalone OCC surface.
 
-    Returns list of (cg_obj, [gmsh_surf_tags]) — one entry per conductor group,
-    aggregating all faces from all child solids in that group.  Surfaces are
-    imported but NOT yet fragmented; call occ.fragment() afterwards.
+    Returns list of (cg_obj, [gmsh_surf_tags]) — one entry per conductor
+    group.  Surfaces are imported but NOT yet fragmented; call
+    occ.fragment() afterwards.
 
     skip_normals : list of FreeCAD.Vector, optional
         Conductor faces whose outward normal is parallel to any of these
@@ -303,18 +496,26 @@ def _import_conductor_solid_faces(gmsh, cond_bodies, log_fn, skip_normals=None):
         exclude conductor end faces that share a plane with a port face,
         which would otherwise create triple-edges causing an MFEM crash.
     """
-    import Part
-    result = []
+    by_group = {}
+    order = []
     for grp, solid in cond_bodies:
+        if grp not in by_group:
+            by_group[grp] = []
+            order.append(grp)
+        by_group[grp].append(solid)
+
+    result = []
+    for grp in order:
+        shape, label = _fuse_group_solids(grp, by_group[grp], log_fn)
         surf_tags_for_grp = []
-        for face_idx, face in enumerate(solid.Shape.Faces):
+        for face_idx, face in enumerate(shape.Faces):
             if skip_normals:
                 try:
                     fn = face.normalAt(0, 0)
                     fn.normalize()
                     if any(abs(fn.dot(pn)) > 0.99 for pn in skip_normals):
                         log_fn(f"Palace: Skipping conductor face {face_idx} of "
-                               f"'{solid.Label}' (end face parallel to a port)\n")
+                               f"'{label}' (end face parallel to a port)\n")
                         continue
                 except Exception:
                     pass
@@ -329,14 +530,14 @@ def _import_conductor_solid_faces(gmsh, cond_bodies, log_fn, skip_normals=None):
                 surf_tags_for_grp.extend(new_tags)
             except Exception as exc:
                 log_fn(f"Palace: WARNING — could not import face {face_idx} of "
-                       f"conductor solid '{solid.Label}': {exc}\n")
+                       f"conductor '{label}': {exc}\n")
             finally:
                 try:
                     os.unlink(brep_path)
                 except OSError:
                     pass
         if surf_tags_for_grp:
-            log_fn(f"Palace: Conductor '{grp.Label}' solid '{solid.Label}' → "
+            log_fn(f"Palace: Conductor '{label}' → "
                    f"{len(surf_tags_for_grp)} face surface(s) imported\n")
         result.append((grp, surf_tags_for_grp))
     return result
@@ -467,6 +668,11 @@ def _apply_refinement_fields(
     - Integration edge curves  → SizeMin = port_size / 2
 
     cond_data / diel_data / imp_data : list of (group_obj, [gmsh_surf_tag, ...])
+
+    Returns True if at least one Distance/Threshold field was actually created
+    (i.e. some group/global size was non-zero), False if every size resolved
+    to 0 and gmsh is left to size the entire model on its own defaults --
+    the caller uses this to explain a subsequent meshing failure.
     """
     # Estimate reference size and transition distance from model extent.
     xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(-1, -1)
@@ -533,7 +739,7 @@ def _apply_refinement_fields(
                             dist_max * 0.4)
 
     if not thresh_ids:
-        return
+        return False
 
     mid = gmsh.model.mesh.field.add("Min")
     gmsh.model.mesh.field.setNumbers(mid, "FieldsList", thresh_ids)
@@ -550,6 +756,7 @@ def _apply_refinement_fields(
         f"port zone ({n_port} surface(s)), "
         f"integration edge zone ({n_edge} curve(s)) — background mesh set.\n"
     )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +853,8 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
 
     Returns
     -------
-    str : absolute path to the written .msh file
+    (str, str, dict) : absolute paths to the written .msh file and .step file, and a
+                        mesh-quality summary (see _check_mesh_quality)
     """
     if log_fn is None:
         log_fn = lambda msg: FreeCAD.Console.PrintMessage(
@@ -706,6 +914,9 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
     for extra in _port_shape_parents(doc):
         if extra not in export_objs:
             export_objs.append(extra)
+
+    for obj in export_objs:
+        _validate_shape(obj.Shape, obj.Label, log_fn)
 
     step_path = os.path.join(output_dir, "geometry.step")
     Part.export(export_objs, step_path)
@@ -943,6 +1154,7 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
         # pass every currently-tracked surface as an explicit tool object so that
         # out_map gives us an old→new entity-tag mapping for them too.
         imp_data = []   # (imp_obj, [gmsh_surf_tags]) — populated by all three port paths below
+        cond_final_data = []   # (grp, [post-fragment gmsh_surf_tags]) — for refinement fields
 
         if (planar_port_surf_list or wave_port_surf_list
                 or cond_brep_surf_list or wave_port_edge_list):
@@ -1095,12 +1307,15 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
             cond_attr_surf_map = {}   # attr → [final surf tags]
             for grp, orig_cond_tags in cond_brep_surf_list:
                 attr = grp.MeshAttribute
+                grp_final_tags = []
                 for old_tag in orig_cond_tags:
                     new_tags_for_face = old_to_new_surf.get(old_tag, [old_tag])
                     unclaimed = [t for t in new_tags_for_face
                                  if t not in used_surface_tags]
                     cond_attr_surf_map.setdefault(attr, []).extend(unclaimed)
+                    grp_final_tags.extend(unclaimed)
                     used_surface_tags.update(unclaimed)
+                cond_final_data.append((grp, grp_final_tags))
 
             for attr, surf_tags in cond_attr_surf_map.items():
                 if surf_tags:
@@ -1339,10 +1554,10 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
         # Impedance boundary surfaces are excluded from the port_size zone and
         # handled separately via imp_data so the user can control their size.
         _imp_surface_tags = {t for _, tags in imp_data for t in tags}
-        _apply_refinement_fields(
+        _sizing_applied = _apply_refinement_fields(
             gmsh,
             cl_max           = cl_max,
-            cond_data        = cond_brep_surf_list,
+            cond_data        = cond_final_data,
             port_surf_tags   = list(
                 (wave_port_surface_tags | lumped_port_surface_tags) - _imp_surface_tags
             ),
@@ -1356,7 +1571,24 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
         )
 
         log_fn("Palace: Running Gmsh 3D mesh generation…\n")
-        gmsh.model.mesh.generate(3)
+        try:
+            gmsh.model.mesh.generate(3)
+        except Exception:
+            if not _sizing_applied:
+                log_fn(
+                    "Palace: HINT — no MeshSize is set anywhere (every conductor/"
+                    "dielectric group and the Mesh object's MeshConductorSize/"
+                    "MeshPortSize/MeshCharacteristicLength* are all 0/auto), so Gmsh "
+                    "sized the whole model on its own default heuristic, scaled to "
+                    "the airbox. A thin feature (a small-radius coax, a narrow trace, "
+                    "a thin dielectric layer) far smaller than the airbox can then "
+                    "get facets too coarse to triangulate without self-overlap, which "
+                    "is a common cause of the meshing failure above. Try setting "
+                    "MeshSize (e.g. a fraction of that feature's smallest cross-"
+                    "section) on the relevant Conductor/Dielectric/ImpedanceBoundary "
+                    "group, or MeshConductorSize on the Mesh object, and re-run.\n"
+                )
+            raise
         _flush_gmsh()
 
         # Use order-2 elements so that boundary curve midpoint nodes lie exactly
@@ -1367,6 +1599,11 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
         gmsh.model.mesh.setOrder(2)
         _flush_gmsh()
 
+        quality = _check_mesh_quality(
+            gmsh, log_fn,
+            getattr(_mesh_obj, "MeshQualityWarnThreshold", 0.1) if _mesh_obj else 0.1,
+        )
+
         # MFEM (used by Palace) requires MSH v2.2; v4 triggers a "vertices indices
         # are not unique" abort due to non-contiguous node numbering in that format.
         gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
@@ -1374,7 +1611,7 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
         gmsh.write(mesh_path)
         _flush_gmsh()
 
-        return mesh_path
+        return mesh_path, step_path, quality
 
     finally:
         gmsh.logger.stop()

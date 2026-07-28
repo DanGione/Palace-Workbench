@@ -6,6 +6,8 @@ A FreeCAD 1.0 workbench for 3D electromagnetic FEM simulation using the
 Supports driven S-parameter sweeps, eigenmode analysis, and electrostatic
 simulations — all configured and launched from the FreeCAD GUI.
 
+![Palace Workbench in FreeCAD, showing a meshed Wilkinson splitter model alongside the S-parameter viewer](docs/images/Palace_Simulator_Screenshot.png)
+
 ## Quick Start (Docker)
 
 **Requirements:** [Docker Desktop](https://www.docker.com/products/docker-desktop/)
@@ -41,6 +43,18 @@ To stop: `Ctrl+C` in the terminal, or `docker compose down`.
 6. Add **Dielectric** or **Conductor** groups for material regions as needed.
 7. Click **Generate & Run** to mesh and solve.
 8. Results open automatically in the built-in S-parameter viewer.
+
+## Documentation
+
+| Guide | Description |
+|---|---|
+| [Getting Started](docs/getting-started.md) | End-to-end first simulation walkthrough |
+| [Geometry Guide](docs/geometry-guide.md) | Preparing geometry, materials, and VarSets |
+| [Ports Reference](docs/ports-reference.md) | Lumped Port, Wave Port, Impedance Boundary |
+| [Simulation Reference](docs/simulation-reference.md) | Simulation, Airbox, and Mesh settings |
+| [Results & Export](docs/results-and-export.md) | S-parameter viewer, sweep results, Touchstone |
+| [Sweep & Optimization](docs/sweep-and-optimization.md) | Parameter sweeps and geometry optimization |
+| [Troubleshooting](docs/troubleshooting.md) | Common issues and fixes |
 
 ## Example Files
 
@@ -83,3 +97,34 @@ Then open the browser link printed in the terminal output.
 If you already have FreeCAD 1.0 and Palace installed natively, install the workbench via
 **Tools → Addon Manager → Install from URL** using this repository's URL.
 Set the Palace binary path in the Simulation object properties after installation.
+
+## Acknowledgements
+
+This project would not be possible without the following open-source projects:
+
+- **[Palace](https://github.com/awslabs/palace)** (AWS Labs) — the electromagnetic
+  FEM solver that powers all simulations.
+
+- **[FreeCAD](https://www.freecad.org)** — the open-source parametric CAD platform
+  this workbench extends.
+
+- **[Gmsh](https://gmsh.info)** (Christophe Geuzaine & Jean-François Remacle) — the
+  finite element mesh generator used to produce volumetric meshes from CAD geometry.
+
+- **[NumPy](https://numpy.org)**, **[Matplotlib](https://matplotlib.org)**, and
+  **[SciPy](https://scipy.org)** — scientific Python libraries used for post-processing
+  and visualization.
+
+## License
+
+The Palace Workbench source code (the Python files in this repository) is released
+under the **MIT License**.
+
+The Docker image bundles several third-party packages under their own licenses:
+FreeCAD (LGPL 2.1+), Palace (Apache 2.0), Gmsh (GPL 2+), and others. Those
+licenses govern their respective components and are unaffected by this project's
+MIT license.
+
+---
+
+*This project was developed with the assistance of [Claude Code](https://claude.ai/code) by Anthropic.*

@@ -66,28 +66,46 @@ class PalaceWorkbench(FreeCADGui.Workbench):
 
     def Initialize(self):
         _ensure_dependencies()
+        from commands.doc_events import register_once
+        register_once()
         from commands.cmd_simulation import CmdSimulation
         from commands.cmd_airbox import CmdAirbox
         from commands.cmd_lumped_port import CmdLumpedPort
         from commands.cmd_wave_port import CmdWavePort
         from commands.cmd_impedance_boundary import CmdImpedanceBoundary
+        from commands.cmd_smd_component import CmdSMDComponent
         from commands.cmd_material_group import CmdDielectricGroup, CmdConductorGroup
+        from commands.cmd_component import CmdCreateComponent
+        from commands.cmd_component_io import CmdExportComponent, CmdImportComponent
         from commands.cmd_mesh import CmdMesh
         from commands.cmd_run import CmdRun, CmdRunOnly, CmdStopRun
         from commands.cmd_results import CmdViewResults
+        from commands.cmd_export import CmdExportMesh, CmdExportGeometry, CmdExportConfig
+        from commands.cmd_sweep import CmdSweep, CmdRunSweep, CmdStopSweep, CmdViewSweep
 
         FreeCADGui.addCommand("Palace_Simulation",      CmdSimulation())
         FreeCADGui.addCommand("Palace_Airbox",          CmdAirbox())
         FreeCADGui.addCommand("Palace_LumpedPort",          CmdLumpedPort())
         FreeCADGui.addCommand("Palace_WavePort",            CmdWavePort())
         FreeCADGui.addCommand("Palace_ImpedanceBoundary",   CmdImpedanceBoundary())
+        FreeCADGui.addCommand("Palace_SMDComponent",        CmdSMDComponent())
         FreeCADGui.addCommand("Palace_DielectricGroup", CmdDielectricGroup())
         FreeCADGui.addCommand("Palace_ConductorGroup",  CmdConductorGroup())
+        FreeCADGui.addCommand("Palace_CreateComponent",  CmdCreateComponent())
+        FreeCADGui.addCommand("Palace_ExportComponent",  CmdExportComponent())
+        FreeCADGui.addCommand("Palace_ImportComponent",  CmdImportComponent())
         FreeCADGui.addCommand("Palace_Mesh",            CmdMesh())
         FreeCADGui.addCommand("Palace_Run",             CmdRun())
         FreeCADGui.addCommand("Palace_RunOnly",         CmdRunOnly())
         FreeCADGui.addCommand("Palace_StopRun",         CmdStopRun())
         FreeCADGui.addCommand("Palace_ViewResults",     CmdViewResults())
+        FreeCADGui.addCommand("Palace_ExportMesh",      CmdExportMesh())
+        FreeCADGui.addCommand("Palace_ExportGeometry",  CmdExportGeometry())
+        FreeCADGui.addCommand("Palace_ExportConfig",    CmdExportConfig())
+        FreeCADGui.addCommand("Palace_Sweep",           CmdSweep())
+        FreeCADGui.addCommand("Palace_RunSweep",        CmdRunSweep())
+        FreeCADGui.addCommand("Palace_StopSweep",       CmdStopSweep())
+        FreeCADGui.addCommand("Palace_ViewSweep",       CmdViewSweep())
 
         cmds = [
             "Palace_Simulation",
@@ -95,14 +113,26 @@ class PalaceWorkbench(FreeCADGui.Workbench):
             "Palace_LumpedPort",
             "Palace_WavePort",
             "Palace_ImpedanceBoundary",
+            "Palace_SMDComponent",
             "Palace_DielectricGroup",
             "Palace_ConductorGroup",
+            "Palace_CreateComponent",
+            "Palace_ExportComponent",
+            "Palace_ImportComponent",
             "Separator",
             "Palace_Mesh",       # mesh only — inspect before solving
             "Palace_Run",        # generate mesh + run
             "Palace_RunOnly",    # run with existing mesh
             "Palace_StopRun",
             "Palace_ViewResults",
+            "Palace_ExportMesh",
+            "Palace_ExportGeometry",
+            "Palace_ExportConfig",
+            "Separator",
+            "Palace_Sweep",
+            "Palace_RunSweep",
+            "Palace_StopSweep",
+            "Palace_ViewSweep",
         ]
         self.appendToolbar("Palace", cmds)
         self.appendMenu("Palace", cmds)

@@ -255,8 +255,10 @@ class PalaceMesh:
         self._init_properties(obj)
 
     def _init_properties(self, obj):
-        _add(obj, "App::PropertyString", "MeshFile", "Mesh",
-             "Absolute path to the last-generated mesh.msh file", "")
+        _add(obj, "App::PropertyFileIncluded", "MeshFile", "Mesh",
+             "Embedded Gmsh .msh file (generated automatically)", "")
+        _add(obj, "App::PropertyFileIncluded", "GeometryFile", "Mesh",
+             "Embedded STEP snapshot of the meshed geometry (generated automatically)", "")
         _add(obj, "App::PropertyFloat", "MeshCharacteristicLengthMax", "Mesh",
              "Gmsh global maximum element size in model units (0 = Gmsh default)", 0.0)
         _add(obj, "App::PropertyFloat", "MeshCharacteristicLengthMin", "Mesh",
@@ -270,6 +272,9 @@ class PalaceMesh:
         _add(obj, "App::PropertyFloat", "MeshRefineDistance", "Refinement",
              "Distance (mm) over which refinement transitions to global cl_max. "
              "0 = auto (30% of model extent).", 0.0)
+        _add(obj, "App::PropertyFloat", "MeshQualityWarnThreshold", "Refinement",
+             "Minimum acceptable tetrahedron quality (Gmsh minSICN, 0-1) before the "
+             "post-mesh quality check warns. 0 = disabled.", 0.1)
         _add(obj, "App::PropertyIntegerList", "HiddenSurfAttributes", "Mesh",
              "Surface physical-group attribute numbers hidden from the 3D view", [])
         _add(obj, "App::PropertyIntegerList", "HiddenVolAttributes", "Mesh",
@@ -310,6 +315,17 @@ class PalaceMesh:
 
     def onDocumentRestored(self, obj):
         self._init_properties(obj)
+        from palace.embedded_files import migrate_legacy_string_property, legacy_sibling_path
+        migrate_legacy_string_property(
+            obj, "MeshFile", "Mesh",
+            "Embedded Gmsh .msh file (generated automatically)",
+            legacy_hint=legacy_sibling_path(obj.Document, "mesh.msh"),
+        )
+        migrate_legacy_string_property(
+            obj, "GeometryFile", "Mesh",
+            "Embedded STEP snapshot of the meshed geometry (generated automatically)",
+            legacy_hint=legacy_sibling_path(obj.Document, "geometry.step"),
+        )
 
     def __getstate__(self):
         return None
