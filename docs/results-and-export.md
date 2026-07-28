@@ -24,13 +24,16 @@ The checkboxes on the left list every computed S-parameter (S11, S21, etc.). Che
 
 ### Renormalization
 
-S-parameters are extracted relative to each port's characteristic impedance (computed by Palace for Wave Ports, or set directly for Lumped Ports). If you want to view them at a different reference impedance (e.g., renormalize everything to 50 Ω), use the **Renorm target Z** field on the Wave Port panel before running, or use the **Renorm Z** control in the viewer panel (if present) after the run.
+S-parameters are extracted relative to each port's characteristic impedance (computed by Palace for Wave Ports, or set directly for Lumped Ports). If you want to view them at a different reference impedance (e.g., renormalize everything to 50 Ω), set the **Renorm target Z** field on each Wave Port panel, then click **Renormalize to Port Targets** in the viewer.
+
+The button toggles: once applied, it changes to **Un-normalize Port Impedances**, which reverts the plot back to the original per-port reference impedances. This state is remembered on the Simulation object, so it survives closing/reopening the document and re-running the simulation — a project you left normalized reopens normalized, rather than requiring you to re-apply it (or risking applying it twice).
 
 ### Export Touchstone
 
-Click **Export Touchstone…** to save the S-parameters as an `.sNp` file (Touchstone format), which can be imported into Keysight ADS, AWR Microwave Office, or any other RF EDA tool.
+Click **Export Touchstone…** to save the S-parameters as an `.sNp` file (Touchstone format), which can be imported into Keysight ADS, AWR Microwave Office, or any other RF EDA tool. The reference impedance written to the file reflects each port's actual impedance at the time of export (the renormalized value, if renormalization is active):
 
-> **Known limitation:** The Export button currently uses 50 Ω as the reference impedance for all ports, regardless of the actual port impedances. If your ports are not 50 Ω, renormalize before exporting.
+- If every port shares the same reference impedance, a standard Touchstone 1.0 file is written (`# GHz S DB R <value>`).
+- If ports differ — e.g. an un-renormalized Wave Port's computed impedance isn't 50 Ω while a Lumped Port is — the file is upgraded to Touchstone 2.0, which lists each port's impedance individually via a `[Reference]` line. This is supported by ADS, HFSS, scikit-rf, and other modern RF/EDA tools.
 
 ---
 

@@ -157,15 +157,10 @@ class SParamPanel(QtWidgets.QDockWidget):
 
         # --- action buttons row ---
         action_row = QtWidgets.QHBoxLayout()
-        self._btn_renorm = QtWidgets.QPushButton("Renormalize to Port Targets")
-        self._btn_renorm.setToolTip(
-            "Reads CharacteristicZ and RenormZ from each wave port in the active\n"
-            "FreeCAD document and renormalizes the S-matrix accordingly.\n"
-            "Wave ports use CharacteristicZ as the current reference impedance;\n"
-            "lumped ports use their R value."
-        )
+        self._btn_renorm = QtWidgets.QPushButton()
+        self._set_renorm_button_state(active=False)
         self._btn_renorm.setEnabled(False)
-        self._btn_renorm.clicked.connect(self._apply_renorm)
+        self._btn_renorm.clicked.connect(self._toggle_renorm)
         action_row.addWidget(self._btn_renorm)
 
         self._btn_export_ts = QtWidgets.QPushButton("Export Touchstone…")
@@ -238,6 +233,7 @@ class SParamPanel(QtWidgets.QDockWidget):
         self._freq, self._mag, self._phase = [], {}, {}
         self._renorm_active = False
         self._s_renorm_mag, self._s_renorm_phase = {}, {}
+        self._set_renorm_button_state(active=False)
         self._file_label.setText("(no results available)")
         self._file_label.setToolTip("")
         self._btn_renorm.setEnabled(False)
@@ -267,6 +263,7 @@ class SParamPanel(QtWidgets.QDockWidget):
         self._renorm_active = False
         self._s_renorm_mag = {}
         self._s_renorm_phase = {}
+        self._set_renorm_button_state(active=False)
 
         self._file_label.setText(os.path.basename(path))
         self._file_label.setToolTip(path)
@@ -275,11 +272,88 @@ class SParamPanel(QtWidgets.QDockWidget):
 
         self._load_selection_from_doc()
         self._rebuild_checkboxes()
-        self._refresh_plot()
+
+        sim = self._active_simulation()
+        if sim is not None and getattr(sim, "SParamRenormActive", False):
+            self._apply_renorm()
+        else:
+            self._refresh_plot()
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _port_reference_impedances(self):
+        """Return (port_z_old, port_z_new) — {port_idx: float} dicts giving the
+        reference impedance each port's S-parameters are (port_z_old) or would
+        be after renormalization (port_z_new) expressed against.
+
+        Wave ports use CharacteristicZ (native ref) / RenormZ (user's renorm
+        target); lumped ports use R for both, since they have no separate
+        native-vs-target distinction. Returns ({}, {}) if there's no active
+        document — callers should treat that as "default to 50 Ω per port".
+        """
+        import FreeCAD
+        doc = FreeCAD.ActiveDocument
+        if doc is None:
+            return {}, {}
+        from features import find_wave_ports, find_lumped_ports
+        port_z_old, port_z_new = {}, {}
+        for wp in find_wave_ports(doc):
+            idx = wp.PortIndex
+            port_z_old[idx] = getattr(wp, "CharacteristicZ", 50.0)
+            port_z_new[idx] = getattr(wp, "RenormZ", 50.0)
+        for lp in find_lumped_ports(doc):
+            idx = lp.PortIndex
+            r   = getattr(lp, "R", 50.0)
+            port_z_old[idx] = r
+            port_z_new[idx] = r
+        return port_z_old, port_z_new
+
+    def _active_simulation(self):
+        """Return the Simulation object in the active document, or None."""
+        try:
+            import FreeCAD
+            from features import find_simulation
+            doc = FreeCAD.ActiveDocument
+            return find_simulation(doc) if doc else None
+        except Exception:
+            return None
+
+    def _persist_renorm_active(self, active):
+        """Save the renorm toggle on the Simulation object so it survives
+        document close/reopen and simulation re-runs."""
+        sim = self._active_simulation()
+        if sim is not None and hasattr(sim, "SParamRenormActive"):
+            sim.SParamRenormActive = active
+
+    def _set_renorm_button_state(self, active):
+        """Sync the renorm button's label/tooltip to whether renorm is applied."""
+        if active:
+            self._btn_renorm.setText("Un-normalize Port Impedances")
+            self._btn_renorm.setToolTip(
+                "Reverts the S-matrix back to its original per-port reference\n"
+                "impedances (CharacteristicZ for wave ports, R for lumped ports)."
+            )
+        else:
+            self._btn_renorm.setText("Renormalize to Port Targets")
+            self._btn_renorm.setToolTip(
+                "Reads CharacteristicZ and RenormZ from each wave port in the active\n"
+                "FreeCAD document and renormalizes the S-matrix accordingly.\n"
+                "Wave ports use CharacteristicZ as the current reference impedance;\n"
+                "lumped ports use their R value."
+            )
+
+    def _toggle_renorm(self):
+        """Button handler: apply renormalization, or undo it if already applied."""
+        if self._renorm_active:
+            self._renorm_active = False
+            self._s_renorm_mag, self._s_renorm_phase = {}, {}
+            self._set_renorm_button_state(active=False)
+            self._persist_renorm_active(False)
+            self._refresh_plot()
+            return
+        self._apply_renorm()
 
     def _apply_renorm(self):
         """Renormalize to per-port targets read from the active FreeCAD document."""
@@ -287,25 +361,14 @@ class SParamPanel(QtWidgets.QDockWidget):
             return
         try:
             import FreeCAD
-            from features import find_wave_ports, find_lumped_ports
-            doc = FreeCAD.ActiveDocument
-            if doc is None:
+            if FreeCAD.ActiveDocument is None:
                 QtWidgets.QMessageBox.warning(
                     self, "No Document",
                     "Open the FreeCAD document containing the simulation ports first."
                 )
                 return
 
-            port_z_old, port_z_new = {}, {}
-            for wp in find_wave_ports(doc):
-                idx = wp.PortIndex
-                port_z_old[idx] = getattr(wp, "CharacteristicZ", 50.0)
-                port_z_new[idx] = getattr(wp, "RenormZ", 50.0)
-            for lp in find_lumped_ports(doc):
-                idx = lp.PortIndex
-                r   = getattr(lp, "R", 50.0)
-                port_z_old[idx] = r
-                port_z_new[idx] = r
+            port_z_old, port_z_new = self._port_reference_impedances()
 
             from palace.post_process import renormalize_s_matrix_from_data
             _, mag, phase = renormalize_s_matrix_from_data(
@@ -314,6 +377,8 @@ class SParamPanel(QtWidgets.QDockWidget):
             self._s_renorm_mag   = mag
             self._s_renorm_phase = phase
             self._renorm_active  = True
+            self._set_renorm_button_state(active=True)
+            self._persist_renorm_active(True)
             self._refresh_plot()
         except Exception as exc:
             try:
@@ -348,12 +413,31 @@ class SParamPanel(QtWidgets.QDockWidget):
         mag   = self._s_renorm_mag   if self._renorm_active else self._mag
         phase = self._s_renorm_phase if self._renorm_active else self._phase
 
+        port_z_old, port_z_new = self._port_reference_impedances()
+        port_z_eff = port_z_new if self._renorm_active else port_z_old
+        z_per_port = [port_z_eff.get(p, 50.0) for p in range(1, n_ports + 1)]
+        uniform = all(abs(z - z_per_port[0]) < 1e-6 * max(abs(z_per_port[0]), 1.0)
+                      for z in z_per_port)
+
         try:
             import io, datetime
             buf = io.StringIO()
             buf.write("! Generated by Palace FreeCAD Workbench\n")
             buf.write(f"! {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            buf.write("# GHz S DB R 50\n")
+            if uniform:
+                buf.write(f"# GHz S DB R {z_per_port[0]:g}\n")
+            else:
+                # Touchstone 1.0's single global R can't represent differing
+                # per-port reference impedances (e.g. a wave port's computed
+                # CharacteristicZ alongside a 50 Ω lumped port) -- upgrade to
+                # Touchstone 2.0's [Reference] keyword, which lists one
+                # impedance per port. The # line's R stays a nominal fallback
+                # for tools that ignore [Reference].
+                buf.write("[Version] 2.0\n")
+                buf.write("# GHz S DB R 50\n")
+                buf.write(f"[Number of Ports] {n_ports}\n")
+                buf.write("[Reference] " + " ".join(f"{z:g}" for z in z_per_port) + "\n")
+                buf.write("[Network Data]\n")
             ordered = [
                 (row, col)
                 for col in range(1, n_ports + 1)
@@ -375,6 +459,9 @@ class SParamPanel(QtWidgets.QDockWidget):
                         first = False
                     else:
                         buf.write(f"             {nums}\n")
+
+            if not uniform:
+                buf.write("[End]\n")
 
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(buf.getvalue())

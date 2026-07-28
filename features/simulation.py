@@ -59,6 +59,9 @@ class SimulationContainer:
         _add(obj, "App::PropertyString", "AvailableSParams", "Palace",
              "JSON list of [[row,col],...] S-param pairs available given current port Excitation "
              "settings (auto-updated on recompute).", "[]")
+        _add(obj, "App::PropertyBool", "SParamRenormActive", "Palace",
+             "Whether the S-Parameter panel's renormalization is applied — persisted so it "
+             "survives document close/reopen and simulation re-runs.", False)
 
         # Mesh sizing
         _add(obj, "App::PropertyFloat", "MeshCharacteristicLengthMax", "Mesh",

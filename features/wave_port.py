@@ -32,13 +32,35 @@ class WavePort:
         _add(obj, "App::PropertyInteger", "MeshAttribute", "Mesh",
              "Gmsh physical surface attribute number", 11)
         _add(obj, "App::PropertyLinkSub", "IntegrationEdge", "Impedance",
-             "Edge on the port face from inner conductor to outer conductor — "
-             "used to integrate E·dl for characteristic impedance extraction")
+             "Edge on the port face from inner conductor (signal) to outer "
+             "conductor (ground) — used as Palace's native VoltagePath for "
+             "voltage/impedance (Z_PV) postprocessing")
         _add(obj, "App::PropertyFloat", "CharacteristicZ", "Impedance",
-             "Characteristic impedance extracted from the field solution (Ω) — "
+             "Characteristic impedance magnitude (Ω), mean of |Z| across "
+             "frequency — Palace's native Z_PV when an Integration edge is "
+             "set, otherwise the TE/TM Poynting-flux impedance — "
              "auto-updated after each simulation run", 50.0)
+        _add(obj, "App::PropertyFloat", "CharacteristicZReal", "Impedance",
+             "Characteristic impedance, real part (Ω) — mean of Re(Z) across "
+             "frequency — auto-updated after each simulation run", 50.0)
+        _add(obj, "App::PropertyFloat", "CharacteristicZImag", "Impedance",
+             "Characteristic impedance, imaginary part (Ω) — mean of Im(Z) "
+             "across frequency — auto-updated after each simulation run", 0.0)
         _add(obj, "App::PropertyFloat", "RenormZ", "Impedance",
              "Target S-parameter normalization impedance (Ω)", 50.0)
+        _add(obj, "App::PropertyInteger", "MaxIts", "Solver",
+             "Krylov solver max iterations for the wave port eigenmode/"
+             "voltage-path solve — 0 = use Palace's default", 0)
+        _add(obj, "App::PropertyFloat", "KSPTol", "Solver",
+             "Krylov solver tolerance — 0 = use Palace's default", 0.0)
+        _add(obj, "App::PropertyFloat", "EigenTol", "Solver",
+             "Eigenmode solve tolerance — 0 = use Palace's default", 0.0)
+        _add(obj, "App::PropertyInteger", "NSamples", "Solver",
+             "VoltagePath internal resampling resolution — 0 = use Palace's "
+             "default (100)", 0)
+        _add(obj, "App::PropertyFloat", "Offset", "Solver",
+             "Port mode profile distance offset, same units as the port "
+             "geometry — 0 = use Palace's default", 0.0)
         _add(obj, "App::PropertyColor",   "GroupColor",        "Display",
              "Color propagated to all child shapes", _PORT_COLOR)
         _add(obj, "App::PropertyInteger", "GroupTransparency", "Display",

@@ -137,6 +137,41 @@ write `append_sweep_point` already does — `_annotate_sweep_run` (a second
 full read-modify-rewrite pass) no longer exists; use `_sweep_run_attrs()`
 (pure, no I/O) instead.
 
+### WavePort native `Z_PV` impedance vs. TE/TM fallback — `palace/config.py`, `palace/post_process.py`, `commands/cmd_run.py`
+Palace ≥0.17.0 computes wave-port characteristic impedance natively (`Z_PV`) from
+a `VoltagePath` (signal→ground line, sourced from `WavePort.IntegrationEdge` via
+`_probe_points_along_edge`) written into each port's `WavePort` JSON entry —
+`_build_boundaries()` emits it whenever `IntegrationEdge` is set, for every pass,
+regardless of which port that pass excites. Ports *without* `IntegrationEdge`
+(hollow single-conductor waveguide, no signal/ground split) have no `VoltagePath`
+equivalent and fall back to the pre-0.17 Poynting-flux calculation
+(`compute_te_tm_impedance` in `palace/post_process.py`) over a grid of field probes.
+
+`_update_wave_port_impedances()` branches accordingly, and the two branches search
+for their source data differently:
+- **`Z_PV`** is excitation-independent (computed from the port's own 2-D
+  boundary-mode eigenproblem, not the 3-D excited-state field) — Palace writes it
+  into *every* pass's `port-Z.csv` for *every* `VoltagePath` port, so this branch
+  searches all passes, not just the one where this port itself was excited.
+- **TE/TM** uses actual field data from `probe-E.csv`/`probe-B.csv`, which is only
+  physically clean at a port's own excited-state reference plane — this branch
+  still requires a pass whose directory name contains `port{N}`.
+
+`port-Z.csv` also contains a visually similar but physically different
+per-excitation `Re{Z[idx][ex]}`/`Im{Z[idx][ex]}` column pair (input impedance
+looking into the port, not the mode characteristic impedance). `parse_wave_port_z_csv()`
+matches the literal `Z_PV` substring, not just `Z`, to avoid silently reading the
+wrong quantity.
+
+Single-excited-port and multi-pass runs now name their Palace output directory
+the same way (`output_port{N}`) specifically so the "does this directory's name
+contain `port{N}`" lookup above works identically regardless of pass count —
+`_build_passes()` used to name the single-pass case bare `"output"`, which meant
+`CharacteristicZ` silently never updated whenever only one port was excited (the
+common case, since most driven runs excite a single port). `_on_done()`'s
+`final_csv` path is derived from `passes[0][1]` for the same reason, rather than
+assuming a hardcoded `"output"`.
+
 ## Dependencies
 
 - **Runtime:** `matplotlib`, `numpy`, `xarray`, `netCDF4`, `gmsh` (lazy-loaded)
@@ -171,7 +206,3 @@ mirroring the source layout. Run tests with:
 python -m pytest tests/ -v
 ```
 
-## Known Future Work
-
-- **Touchstone export** (`panels/s_param_panel.py`): reference impedance hardcoded
-  to 50 Ω — should read per-port Z0 from the document or let the user specify.

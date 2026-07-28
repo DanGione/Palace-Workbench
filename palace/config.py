@@ -154,6 +154,25 @@ def _build_boundaries(airbox, lumped_ports, wave_ports, conductor_groups,
             excited = p.Excitation if only_excitation is None else (p.PortIndex == only_excitation)
             if excited:
                 entry["Excitation"] = True
+            # Signal→ground path for Palace's native Z_PV impedance postprocessing
+            # (requires GSLIB) -- emitted for every port with IntegrationEdge set,
+            # regardless of which port is excited in this pass, since Z_PV comes
+            # from the port's own boundary-mode eigenproblem.
+            voltage_path = _probe_points_along_edge(p)
+            if voltage_path:
+                entry["VoltagePath"] = [[x, y, z] for (x, y, z) in voltage_path]
+            # Optional solver tuning knobs -- 0/0.0 means "unset", let Palace use
+            # its own internal default rather than us guessing/hardcoding it.
+            if getattr(p, "MaxIts", 0) != 0:
+                entry["MaxIts"] = p.MaxIts
+            if getattr(p, "KSPTol", 0.0) != 0.0:
+                entry["KSPTol"] = p.KSPTol
+            if getattr(p, "EigenTol", 0.0) != 0.0:
+                entry["EigenTol"] = p.EigenTol
+            if getattr(p, "NSamples", 0) != 0:
+                entry["NSamples"] = p.NSamples
+            if getattr(p, "Offset", 0.0) != 0.0:
+                entry["Offset"] = p.Offset
             boundaries["WavePort"].append(entry)
 
     return boundaries
@@ -329,18 +348,18 @@ def generate_config(doc, only_excitation=None, output_override=None):
             entry["LossTan"] = dg.LossTangent
         materials.append(entry)
 
-    # Build Domains.Postprocessing.Probe entries for wave ports.
-    #   V-line probes: index = 1000 + port_idx*10 + k   (k=0..7 along IntegrationEdge)
+    # Build Domains.Postprocessing.Probe entries for wave ports that have no
+    # IntegrationEdge -- Palace computes impedance natively via VoltagePath/Z_PV
+    # for ports that do, so no field probes are needed for those.  Ports without
+    # an IntegrationEdge (hollow single-conductor waveguide, no signal/ground
+    # split) fall back to the TE/TM Poynting-flux calc, which still needs a
+    # grid of E/B field probes covering the port face.
     #   Power-grid probes: index = 2000 + (port_idx-1)*200 + k  (k=0..(M*N-1) over PortFace)
-    # Both index ranges are reserved and must not conflict with user-defined probes.
+    # This index range is reserved and must not conflict with user-defined probes.
     probes = []
     for wp in wave_ports:
-        pts = _probe_points_along_edge(wp)
-        for k, (x, y, z) in enumerate(pts):
-            probes.append({
-                "Index": 1000 + wp.PortIndex * 10 + k,
-                "Center": [x, y, z],
-            })
+        if _probe_points_along_edge(wp):
+            continue
         grid_pts, _ = _probe_grid_over_port_face(wp)
         grid_base = 2000 + (wp.PortIndex - 1) * 200
         for k, (x, y, z) in enumerate(grid_pts):

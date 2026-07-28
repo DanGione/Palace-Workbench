@@ -327,14 +327,22 @@ def _port_face_normal(port_obj):
 
 
 def _update_wave_port_impedances(doc, passes):
-    """Extract Z_c from probe fields and store on each WavePort.CharacteristicZ.
+    """Extract Z_c and store on each WavePort.CharacteristicZ.
+
+    Ports with an IntegrationEdge (quasi-TEM, e.g. coax/microstrip/CPW) read
+    Palace's natively-computed Z_PV from port-Z.csv (Palace >=0.17.0, requires
+    VoltagePath -- see palace/config.py). Ports without one (hollow
+    single-conductor waveguide, no signal/ground split) fall back to the
+    TE/TM Poynting-flux calc against probe-E.csv/probe-B.csv, unchanged.
 
     Returns {port_idx: list[complex]} — per-frequency Z0 for each wave port
     where extraction succeeded.
     """
     import math
     from features import find_wave_ports
-    from palace.post_process import parse_probe_csv, compute_wave_port_impedance
+    from palace.post_process import (
+        parse_probe_csv, compute_te_tm_impedance, parse_wave_port_z_csv,
+    )
     from palace.config import _probe_points_along_edge, _probe_grid_over_port_face
 
     wave_ports = find_wave_ports(doc)
@@ -342,73 +350,95 @@ def _update_wave_port_impedances(doc, passes):
     z0_data = {}
 
     for wp in wave_ports:
-        pts           = _probe_points_along_edge(wp)
-        n_probes      = len(pts)
-        probe_indices = [1000 + wp.PortIndex * 10 + k for k in range(n_probes)]
+        has_voltage_path = bool(_probe_points_along_edge(wp))
 
-        grid_pts, _  = _probe_grid_over_port_face(wp)
-        grid_base    = 2000 + (wp.PortIndex - 1) * 200
-        grid_indices = [grid_base + k for k in range(len(grid_pts))]
-
-        if not grid_pts:
-            continue
-
-        # Only compute Z for the pass where this port was excited
-        pass_dir = None
-        for _, d, _ in passes:
-            if f"port{wp.PortIndex}" in os.path.basename(d):
-                pass_dir = d
-                break
-        if not pass_dir:
-            continue
-
-        e_path = os.path.join(pass_dir, "probe-E.csv")
-        b_path = os.path.join(pass_dir, "probe-B.csv")
-        if not os.path.isfile(e_path) or not os.path.isfile(b_path):
-            FreeCAD.Console.PrintWarning(
-                f"Palace: probe files not found for port {wp.PortIndex} in {pass_dir}\n"
-            )
-            continue
-
-        try:
-            _, e_data = parse_probe_csv(e_path)
-            _, b_data = parse_probe_csv(b_path)
-        except Exception as exc:
-            FreeCAD.Console.PrintError(
-                f"Palace: failed to parse probe CSVs for port {wp.PortIndex}: {exc}\n"
-            )
-            continue
-
-        if probe_indices:
-            missing_vline = [i for i in probe_indices if i not in e_data]
-            if missing_vline:
+        if has_voltage_path:
+            # Z_PV is excitation-independent (computed from this port's own
+            # boundary-mode eigenproblem, not the 3-D excited-state field) --
+            # Palace writes it into every pass's port-Z.csv for every
+            # VoltagePath port, not just whichever port that pass excited.
+            # So try every pass rather than requiring this port's own.
+            z_c = None
+            for _, d, _ in passes:
+                z_path = os.path.join(d, "port-Z.csv")
+                if not os.path.isfile(z_path):
+                    continue
+                try:
+                    _, z_pv_data = parse_wave_port_z_csv(z_path)
+                except Exception as exc:
+                    FreeCAD.Console.PrintError(
+                        f"Palace: failed to parse port-Z.csv for port {wp.PortIndex}: {exc}\n"
+                    )
+                    continue
+                z_c = z_pv_data.get(wp.PortIndex)
+                if z_c:
+                    break
+            if not z_c:
                 FreeCAD.Console.PrintWarning(
-                    f"Palace: V-line probe indices {missing_vline} not found for port "
-                    f"{wp.PortIndex}\n"
+                    f"Palace: Port {wp.PortIndex}: Z_PV not found in any pass's "
+                    f"port-Z.csv — re-run simulation to extract CharacteristicZ\n"
+                )
+                continue
+        else:
+            # TE/TM Poynting-flux calc uses actual field data, which is only
+            # physically clean at a port's own excited-state reference plane
+            # -- so, unlike Z_PV above, this requires this port's own pass.
+            pass_dir = None
+            for _, d, _ in passes:
+                if f"port{wp.PortIndex}" in os.path.basename(d):
+                    pass_dir = d
+                    break
+            if not pass_dir:
+                continue
+
+            grid_pts, _  = _probe_grid_over_port_face(wp)
+            grid_base    = 2000 + (wp.PortIndex - 1) * 200
+            grid_indices = [grid_base + k for k in range(len(grid_pts))]
+            if not grid_pts:
+                continue
+
+            e_path = os.path.join(pass_dir, "probe-E.csv")
+            b_path = os.path.join(pass_dir, "probe-B.csv")
+            if not os.path.isfile(e_path) or not os.path.isfile(b_path):
+                FreeCAD.Console.PrintWarning(
+                    f"Palace: probe files not found for port {wp.PortIndex} in {pass_dir}\n"
                 )
                 continue
 
-        missing_grid = [i for i in grid_indices if i not in e_data or i not in b_data]
-        if missing_grid:
-            FreeCAD.Console.PrintWarning(
-                f"Palace: Port {wp.PortIndex}: grid probes not found in output — "
-                f"re-run simulation to extract CharacteristicZ\n"
-            )
-            continue
+            try:
+                _, e_data = parse_probe_csv(e_path)
+                _, b_data = parse_probe_csv(b_path)
+            except Exception as exc:
+                FreeCAD.Console.PrintError(
+                    f"Palace: failed to parse probe CSVs for port {wp.PortIndex}: {exc}\n"
+                )
+                continue
 
-        port_normal = _port_face_normal(wp)
-        z_c = compute_wave_port_impedance(
-            e_data, b_data, probe_indices, pts, grid_indices, grid_pts, port_normal
-        )
-        if not z_c:
-            continue
+            missing_grid = [i for i in grid_indices if i not in e_data or i not in b_data]
+            if missing_grid:
+                FreeCAD.Console.PrintWarning(
+                    f"Palace: Port {wp.PortIndex}: grid probes not found in output — "
+                    f"re-run simulation to extract CharacteristicZ\n"
+                )
+                continue
+
+            port_normal = _port_face_normal(wp)
+            z_c = compute_te_tm_impedance(e_data, b_data, grid_indices, grid_pts, port_normal)
+            if not z_c:
+                continue
 
         z0_data[wp.PortIndex] = z_c
         z_c_mean = float(sum(abs(z) for z in z_c) / len(z_c))
-        if math.isfinite(z_c_mean) and z_c_mean > 0:
+        z_complex_mean = sum(complex(z) for z in z_c) / len(z_c)
+        if (math.isfinite(z_c_mean) and z_c_mean > 0
+                and math.isfinite(z_complex_mean.real) and math.isfinite(z_complex_mean.imag)):
             wp.CharacteristicZ = z_c_mean
+            wp.CharacteristicZReal = z_complex_mean.real
+            wp.CharacteristicZImag = z_complex_mean.imag
             FreeCAD.Console.PrintMessage(
-                f"Palace: Port {wp.PortIndex} CharacteristicZ = {z_c_mean:.2f} Ω\n"
+                f"Palace: Port {wp.PortIndex} CharacteristicZ = {z_c_mean:.2f} Ω "
+                f"({z_complex_mean.real:.2f} {'+' if z_complex_mean.imag >= 0 else '-'} "
+                f"j{abs(z_complex_mean.imag):.2f})\n"
             )
             updated += 1
 
@@ -479,7 +509,14 @@ def _build_passes(doc, tmp_dir):
     excited_ports = _find_excited_ports(doc)
 
     if len(excited_ports) <= 1:
-        tmp_pass_dir = os.path.join(tmp_dir, "output")
+        # Name this the same way a multi-pass port directory would be named
+        # (output_port{N}) so downstream "portN in dirname" lookups (e.g.
+        # _update_wave_port_impedances) work identically regardless of pass
+        # count -- no excited port at all (Palace will itself error out on
+        # this) falls back to the bare "output" name, since there's no port
+        # index to name it after.
+        suffix = f"_port{excited_ports[0].PortIndex}" if excited_ports else ""
+        tmp_pass_dir = os.path.join(tmp_dir, f"output{suffix}")
         os.makedirs(tmp_pass_dir, exist_ok=True)
         config_path = os.path.join(tmp_dir, "palace_config.json")
         cfg = generate_config(doc, output_override=tmp_pass_dir + "/")
@@ -580,7 +617,12 @@ def _on_done(success, message, passes, needs_merge, sim,
     if sim_elapsed is not None:
         FreeCAD.Console.PrintMessage(f"Palace: Simulation time: {sim_elapsed}\n")
 
-    final_csv = os.path.join(tmp_dir, "output", "port-S.csv")
+    # Single pass: Palace wrote port-S.csv directly into that pass's own
+    # directory (now named output_port{N}, or plain "output" if nothing was
+    # excited). Multi-pass: merged below into a dedicated "output" directory
+    # that isn't any individual pass's own directory.
+    final_csv = (os.path.join(passes[0][1], "port-S.csv") if not needs_merge and passes
+                 else os.path.join(tmp_dir, "output", "port-S.csv"))
 
     if needs_merge:
         if console is not None:

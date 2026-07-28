@@ -38,17 +38,37 @@ A wave port solves for the modal field distribution at a cross-section and uses 
 
 **When to avoid:** Structures where the port cross-section does not have a well-defined transverse mode (e.g., the middle of a resonator). Wave ports must be placed at the boundary of the simulation domain (Airbox face).
 
+### Impedance calculation
+
+Palace computes the port's characteristic impedance one of two ways, depending on whether **Integration edge** is set:
+
+- **With an Integration edge** (quasi-TEM structures — coax, microstrip, CPW, or any line with a clear signal/ground conductor pair): Palace computes its native `Z_PV` impedance directly from the field solution along that edge. This is the more accurate method — set the Integration edge whenever the port has a well-defined signal and ground conductor.
+- **Without one** (hollow single-conductor waveguide — rectangular/circular waveguide with no inner conductor): the workbench falls back to a Poynting-flux calculation over the port face, since there's no signal/ground pair to define a voltage path.
+
 ### Panel fields
 
 | Field | Description |
 |---|---|
 | **Port index** | Unique integer identifying this port. |
 | **Port faces** | The face(s) at the Airbox boundary that define the port cross-section. Select in the 3D view, then click **Use current face selection**. |
-| **Integration edge** | An edge on the port face used to define the reference direction for impedance calculation (from ground to signal conductor). Select a single edge, then click **Use current edge selection**. |
+| **Integration edge** | An edge on the port face from the **signal (inner) conductor to the ground (outer) conductor**. Select a single edge, then click **Use current edge selection**. Enables Palace's native `Z_PV` impedance calculation (see above) and fixes the wave-port mode's polarity so cross-type S-parameters (lumped ↔ wave) come out in phase. |
 | **Number of modes** | How many modal modes to include. 1 is sufficient for single-mode structures (microstrip, coax). Increase for overmoded waveguide. |
 | **Excitation** | Check to excite this port as the source. |
-| **Characteristic Z** | Read-only. Displays the characteristic impedance computed by Palace after the last simulation run. Updated automatically. |
+| **Characteristic \|Z\|** | Read-only. Magnitude of the characteristic impedance (mean of \|Z\| across frequency). Auto-updated after each simulation run. |
+| **Characteristic Z** | Read-only. The same impedance as a complex number (`R ± jX`, mean of Re(Z)/Im(Z) across frequency). |
 | **Renorm target Z** | The impedance to renormalize S-parameters to (e.g., 50 Ω). This is independent of Characteristic Z. |
+
+### Advanced (Solver)
+
+Optional tuning for Palace's wave-port eigenmode/voltage-path solve. All default to **Auto** (0), which omits the field from the generated Palace config and lets Palace use its own internal default — leave these alone unless you have a specific reason to change them.
+
+| Field | Description |
+|---|---|
+| **Max iterations** | Krylov solver max iterations for the eigenmode/voltage-path solve. |
+| **KSP tolerance** | Krylov solver convergence tolerance. |
+| **Eigen tolerance** | Eigenmode solve convergence tolerance. |
+| **Voltage path samples** | Internal resampling resolution along the Integration edge for the `Z_PV` line integral (Palace default: 100). |
+| **Mode offset** | Distance offset applied to the port's mode profile, in the same units as the model geometry. |
 
 ---
 
