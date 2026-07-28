@@ -128,7 +128,7 @@ All sizes are in model units (mm if L0 = 1e-3).
 | **Min element size** | Global minimum element edge length. Leave blank unless elements are collapsing on very small features. |
 | **Conductor size** | Element size right at conductor and dielectric surfaces. The mesh grows smoothly from this value back to the global max. Leave blank to use the global max near conductors. Use this to resolve skin-depth effects or narrow coupling gaps. |
 | **Port size** | Element size right at port faces and integration edges. Also controls the node density on edge integration curves. Leave blank to use the global max. |
-| **Refine distance** | Distance over which the mesh transitions from the refined size back to the global max. Leave blank for auto (30% of the model bounding-box extent). |
+| **Refine distance** | Distance over which the mesh transitions from the refined size back to the global max. Leave blank for auto (30% of the model bounding-box extent). Has a floor as well as a ceiling — see below. |
 
 **Typical starting values for a 2.4 GHz PCB filter in mm:**
 
@@ -137,6 +137,23 @@ All sizes are in model units (mm if L0 = 1e-3).
 | Max element size | 2.0 |
 | Conductor size | 0.2 |
 | Port size | 0.3 |
+
+**Refine distance has a floor, not just a ceiling.** Setting it larger than
+necessary wastes elements (the fine region reaches further than it needs to,
+which is the usual reason to tighten it — see [Troubleshooting → Mesh
+generation is very slow](troubleshooting.md#mesh-generation)). But setting it
+*too small* is not merely a missed optimization: Gmsh has to collapse the jump
+from the refined size up to the global max within that distance, and too
+steep a jump produces degenerate or outright inverted tetrahedra right at the
+transition — even when the feature itself is sized perfectly reasonably. As a
+rough rule of thumb, Refine distance should be at least several times the
+ratio between the refined size and the global max (a 0.1 mm Conductor size
+transitioning to a 3 mm global max — a 30× jump — wants several mm of Refine
+distance, not a fraction of a mm). The relationship isn't perfectly linear, so
+if you tighten it, re-run **Generate Mesh** and check the [quality
+check](#mesh-quality-check) result rather than assuming a smaller value is
+always safe; when in doubt, leave it blank (auto) and only tighten it once
+you've confirmed the check still passes.
 
 ### Mesh quality check
 

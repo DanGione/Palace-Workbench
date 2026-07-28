@@ -72,16 +72,22 @@ For a 5 GHz simulation in mm: λ = 300/5 = 60 mm in free space; substrate-loaded
 
 **Mesh generation is very slow**
 
-The mesh is too fine. Check your element size settings. A fine **Conductor size** (e.g., 0.01 mm) with no **Refine distance** set will refine the entire model near every conductor face. Either increase Conductor size or set a Refine distance to limit how far the refinement reaches.
+The mesh is too fine. Check your element size settings. A fine **Conductor size** (e.g., 0.01 mm) with no **Refine distance** set will refine the entire model near every conductor face. Either increase Conductor size or set a Refine distance to limit how far the refinement reaches — but don't swing too far the other way, see the floor described just below and in [Simulation Reference → Mesh panel](simulation-reference.md#mesh-panel).
 
 **Palace warns about low mesh quality / results look wrong even though meshing "succeeded"**
 
-Palace checks tetrahedron quality after every mesh generation and warns (Report View + Palace console, and a Yes/No prompt on a single Run or the first pass of a sweep — see [Simulation Reference → Mesh quality check](simulation-reference.md#mesh-quality-check)) when it finds degenerate or sliver elements. In practice this almost always comes from **one Conductor or Dielectric group mixing a very thin feature with a much larger body** — e.g. a 25–50 µm trace or ground-plane layer in the same group as a millimeter-scale connector shell or via barrel. **Conductor size** applies to every surface in that group, so:
+Palace checks tetrahedron quality after every mesh generation and warns (Report View + Palace console, and a Yes/No prompt on a single Run or the first pass of a sweep — see [Simulation Reference → Mesh quality check](simulation-reference.md#mesh-quality-check)) when it finds degenerate or sliver elements. Two distinct causes produce the same symptom:
 
-- Too coarse (or left blank) for the thin feature → Gmsh can't resolve it and produces near-zero-quality (sometimes inverted) tetrahedra right at the seam.
-- Fine enough for the thin feature but applied to the whole group → the large body gets meshed at that same fine resolution too, which can multiply the total element count far more than the thin feature alone would need.
+1. **One Conductor or Dielectric group mixing a very thin feature with a much larger body** — e.g. a 25–50 µm trace or ground-plane layer in the same group as a millimeter-scale connector shell or via barrel. **Conductor size** applies to every surface in that group, so:
 
-Set **Conductor size** to roughly the thinnest feature's own thickness in that group, and set a **Refine distance** so the fine region doesn't have to reach across the whole model — then re-check the warning is gone. Note that exact-touching vs. slightly-overlapping geometry is *not* the deciding factor here; a real interference fit between the two solids doesn't materially change element quality if the size setting is still too coarse for the thinner one. See also [Geometry Guide → Common pitfalls](geometry-guide.md#common-pitfalls).
+   - Too coarse (or left blank) for the thin feature → Gmsh can't resolve it and produces near-zero-quality (sometimes inverted) tetrahedra right at the seam.
+   - Fine enough for the thin feature but applied to the whole group → the large body gets meshed at that same fine resolution too, which can multiply the total element count far more than the thin feature alone would need.
+
+   Set **Conductor size** to roughly the thinnest feature's own thickness in that group, and set a **Refine distance** so the fine region doesn't have to reach across the whole model — then re-check the warning is gone. Note that exact-touching vs. slightly-overlapping geometry is *not* the deciding factor here; a real interference fit between the two solids doesn't materially change element quality if the size setting is still too coarse for the thinner one.
+
+2. **Refine distance set too tight for a single, already-well-scaled feature.** Even when **Conductor size**/**Port size** is a good match for the feature itself, an explicit **Refine distance** that's too short forces Gmsh to collapse a large size jump (refined size → global max) into a short span, which alone can produce inverted elements at the transition — no group-mixing needed. Tell-tale sign: the warning names a group whose own Conductor/Port size already looks reasonable for its geometry. Fix: lengthen **Refine distance** (or clear it back to blank/auto) rather than touching the feature's own size. On one real case (a 0.1 mm coax conductor transitioning to a 3 mm background), widening Refine distance from 0.2 mm to auto (~12 mm) took the worst element quality from clearly inverted to essentially zero — at the cost of a 3× larger, roughly 2× slower mesh. The relationship isn't perfectly linear (an intermediate value can occasionally be worse than either end), so increase it in steps and re-check the quality result rather than jumping straight to the largest value, especially if mesh cost matters (e.g. for repeated sweep/optimization runs).
+
+See also [Geometry Guide → Common pitfalls](geometry-guide.md#common-pitfalls).
 
 ---
 
