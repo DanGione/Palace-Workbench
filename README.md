@@ -58,7 +58,7 @@ To stop: `Ctrl+C` in the terminal, or `docker compose down`.
 
 ## Example Files
 
-Three worked examples are included in the repository under the `projects/` folder:
+Three worked examples are included in the repository under the `examples/` folder:
 - `Microstrip_test_new.FCStd` — microstrip transmission line, S-parameter extraction
 - `Filter_2p4G.FCStd` — 2.4 GHz bandpass filter
 - `Wilkinson_Splitter.FCStd` — Wilkinson power divider
@@ -108,8 +108,10 @@ This project would not be possible without the following open-source projects:
 - **[FreeCAD](https://www.freecad.org)** — the open-source parametric CAD platform
   this workbench extends.
 
-- **[Gmsh](https://gmsh.info)** (Christophe Geuzaine & Jean-François Remacle) — the
-  finite element mesh generator used to produce volumetric meshes from CAD geometry.
+- **[Gmsh](https://gmsh.info)** (Christophe Geuzaine & Jean-François Remacle) and
+  **[Netgen](https://ngsolve.org)** (Joachim Schöberl) — the two finite element mesh
+  generators used to produce volumetric meshes from CAD geometry (selectable per
+  document; see [Simulation Reference](docs/simulation-reference.md#choosing-a-mesh-backend)).
 
 - **[NumPy](https://numpy.org)**, **[Matplotlib](https://matplotlib.org)**, and
   **[SciPy](https://scipy.org)** — scientific Python libraries used for post-processing
@@ -121,7 +123,7 @@ The Palace Workbench source code (the Python files in this repository) is releas
 under the **MIT License**.
 
 The Docker image bundles several third-party packages under their own licenses:
-FreeCAD (LGPL 2.1+), Palace (Apache 2.0), Gmsh (GPL 2+), and others. Those
+FreeCAD (LGPL 2.1+), Palace (Apache 2.0), Gmsh (GPL 2+), Netgen (LGPL 2.1), and others. Those
 licenses govern their respective components and are unaffected by this project's
 MIT license.
 
