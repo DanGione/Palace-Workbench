@@ -1,6 +1,7 @@
 import FreeCAD
 import os
-from features import add_to_simulation
+from features import find_port_group
+from features.object_group import add_to_port_group, cleanup_group_if_orphaned
 
 _ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "WavePort.svg")
 
@@ -67,6 +68,17 @@ class WavePort:
              "Transparency 0-100 propagated to all child shapes", _PORT_TRANSP)
 
     def onChanged(self, obj, prop):
+        if prop == "PortIndex":
+            if hasattr(obj, "MeshAttribute"):
+                obj.MeshAttribute = 10 + obj.PortIndex
+            # Label stays permanently locked to PortIndex -- shared "Port N"
+            # naming with LumpedPort (same numbering sequence, so the label
+            # must read the same way regardless of port type), auto-synced
+            # rather than set once at creation so it can never drift out of
+            # sync the way it used to (verified on a real board: a port's
+            # Name, Label, and PortIndex had all drifted to different
+            # numbers after enough create/delete/edit cycles).
+            obj.Label = f"Port {obj.PortIndex}"
         if prop in ("GroupColor", "GroupTransparency"):
             from features.material_group import _propagate_from_data
             _propagate_from_data(obj)
@@ -76,6 +88,10 @@ class WavePort:
 
     def onDocumentRestored(self, obj):
         self._init_properties(obj)
+        if hasattr(obj, "PortIndex") and hasattr(obj, "MeshAttribute"):
+            obj.MeshAttribute = 10 + obj.PortIndex
+        if hasattr(obj, "PortIndex"):
+            obj.Label = f"Port {obj.PortIndex}"
         if not hasattr(obj, "Group"):
             try:
                 obj.addExtension("App::GroupExtensionPython")
@@ -143,6 +159,10 @@ class ViewProviderWavePort:
         self.setEdit(vobj)
         return True
 
+    def onDelete(self, vobj, subelements):
+        cleanup_group_if_orphaned(vobj.Object.Document, find_port_group, vobj.Object)
+        return True
+
     def __getstate__(self):
         return None
 
@@ -160,6 +180,6 @@ def create_wave_port(doc, index=1, faces=None):
         obj.PortFaces = faces
     if obj.ViewObject is not None:
         ViewProviderWavePort(obj.ViewObject)
-    add_to_simulation(doc, obj)
+    add_to_port_group(doc, obj)
     doc.recompute()
     return obj

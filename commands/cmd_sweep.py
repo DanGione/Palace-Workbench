@@ -147,6 +147,7 @@ class _SweepCoordinator:
         self._run_index = 0
         self._mesh_quality_warnings = []
         self._cancelled = False
+        self._mesh_proc = None
         # Store original param values to restore on cancel
         self._originals = self._save_originals()
 
@@ -179,6 +180,9 @@ class _SweepCoordinator:
         coord = CmdRun._coordinator
         if coord and coord.is_running():
             coord.stop()
+        # Stop an in-flight mesh subprocess too (see _launch_run)
+        from palace.mesh_runner import kill_mesh_process
+        kill_mesh_process(self._mesh_proc)
 
     def _run_next(self):
         if self._cancelled:
@@ -231,7 +235,7 @@ class _SweepCoordinator:
 
     def _launch_run(self, out_dir, coord_value):
         from commands.cmd_run import _build_passes, _launch_passes, _fmt_elapsed
-        from palace.meshing import generate_mesh
+        from palace.mesh_runner import generate_mesh_subprocess
 
         doc = self._doc
         sim = next((o for o in doc.Objects if hasattr(o, "SimulationType")), None)
@@ -252,7 +256,11 @@ class _SweepCoordinator:
         try:
             doc.recompute()
             t0_mesh = time.time()
-            mesh_path, geometry_path, quality = generate_mesh(doc, out_dir, log_fn=_mesh_log)
+            mesh_path, geometry_path, quality = generate_mesh_subprocess(
+                doc, out_dir, log_fn=_mesh_log,
+                proc_callback=lambda p: setattr(self, "_mesh_proc", p),
+            )
+            self._mesh_proc = None
             mesh_elapsed = _fmt_elapsed(time.time() - t0_mesh)
             if sim:
                 sim.MeshFile = mesh_path
@@ -409,6 +417,7 @@ class _OptimizationCoordinator(QObject):
         self._best_params = None
         self._mesh_quality_warnings = []
         self._cancelled = False
+        self._mesh_proc = None
         self._result_queue = queue.Queue()
         self._eval_event = threading.Event()
         self._pending_params = None
@@ -448,6 +457,9 @@ class _OptimizationCoordinator(QObject):
         coord = CmdRun._coordinator
         if coord and coord.is_running():
             coord.stop()
+        # Stop an in-flight mesh subprocess too (see _launch_eval)
+        from palace.mesh_runner import kill_mesh_process
+        kill_mesh_process(self._mesh_proc)
 
     def _optimizer_thread(self):
         try:
@@ -582,7 +594,7 @@ class _OptimizationCoordinator(QObject):
 
     def _launch_eval(self, out_dir, eval_idx, param_set):
         from commands.cmd_run import _build_passes, _launch_passes, _fmt_elapsed
-        from palace.meshing import generate_mesh
+        from palace.mesh_runner import generate_mesh_subprocess
 
         doc = self._doc
         sim = next((o for o in doc.Objects if hasattr(o, "SimulationType")), None)
@@ -605,7 +617,11 @@ class _OptimizationCoordinator(QObject):
         try:
             doc.recompute()
             t0_mesh = time.time()
-            mesh_path, geometry_path, quality = generate_mesh(doc, out_dir, log_fn=_mesh_log)
+            mesh_path, geometry_path, quality = generate_mesh_subprocess(
+                doc, out_dir, log_fn=_mesh_log,
+                proc_callback=lambda p: setattr(self, "_mesh_proc", p),
+            )
+            self._mesh_proc = None
             mesh_elapsed = _fmt_elapsed(time.time() - t0_mesh)
             if sim:
                 sim.MeshFile = mesh_path

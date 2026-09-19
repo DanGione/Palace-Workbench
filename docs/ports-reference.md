@@ -2,7 +2,13 @@
 
 Ports are where RF energy enters and exits the simulation. Palace supports three port types: Lumped Port, Wave Port, and Impedance Boundary. Each is added from the Palace toolbar and configured with its own panel.
 
-Every port has a **Port index** (1-based integer). Indices must be unique across all ports in the model. The index determines the row/column in the S-parameter matrix: Port 1 corresponds to S11, S21, etc.
+Every port has a **Port index** (1-based integer). Indices must be unique across all ports in the model. The index determines the row/column in the S-parameter matrix: Port 1 corresponds to S11, S21, etc. Lumped Ports and Wave Ports **share one numbering sequence** — adding a Wave Port then a Lumped Port numbers them 1 and 2, not 1 and 1; Impedance Boundaries have their own separate numbering (starting at 1000) so they never shift the excitation-port numbers.
+
+Each port's tree label is always exactly **"Port N"**, kept locked to its Port index automatically — if you change the index, the label updates to match, and it can't drift out of sync. This is deliberately the same format for both Lumped and Wave Ports, since they share the one numbering sequence above.
+
+### Tree organization
+
+Once your model has more than a couple of ports (or Impedance Boundaries), they're automatically collected into a **Ports** group (and a separate **Impedance Boundaries** group) in the model tree, the same way Conductor/Dielectric material groups declutter conductor and dielectric bodies. SMD/generic Components get the same treatment in a **Components** group. These groups appear and disappear on their own — there's nothing to create or configure: the first port creates the group and sweeps in any ports already in the document, and the group vanishes again if you delete every port in it.
 
 ---
 

@@ -6,7 +6,8 @@ Mesh_Report_*.txt
 palace_output/
 output/
 output_*/
-projects/
+projects/*
+!projects/.gitkeep
 .devcontainer/Log/
 Coax_test.FCStd
 Coax_test_new.FCStd

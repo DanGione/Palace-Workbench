@@ -16,10 +16,12 @@ import pytest
 
 from palace.meshing import (
     _apply_refinement_fields,
+    _assign_material_physical_groups,
     _check_mesh_quality,
     _fuse_group_solids,
-    _import_conductor_solid_faces,
+    _import_conductor_solids,
     _log_group_overlaps,
+    _update_vol_physical_groups_after_fragment,
     format_quality_warning,
 )
 
@@ -171,10 +173,20 @@ def test_fuse_failure_falls_back_to_unfused_compound():
 
 
 # ---------------------------------------------------------------------------
-# Integration: _import_conductor_solid_faces with a live Gmsh session
+# Integration: _import_conductor_solids with a live Gmsh session
 # ---------------------------------------------------------------------------
+# Conductors are imported as their own standalone Gmsh *volumes* (not
+# decomposed into faces) so the combined port+conductor occ.fragment() pass
+# can include them as objects and let OCC's boolean kernel actually carve
+# each conductor's cavity out of the surrounding material. Importing only
+# bare faces and relying on fragment() to infer an enclosed cavity from that
+# loose set was tried first and found unreliable in production (see
+# CLAUDE.md) -- roughly half of every conductor's own faces ended up either
+# bounding zero volumes or absorbed into a coincident dielectric/dielectric
+# interface, both of which crash Palace's MFEM solver on launch (STable3D
+# abort from a boundary triangle with no adjacent tetrahedron).
 
-def test_import_conductor_solid_faces_fuses_before_export():
+def test_import_conductor_solids_fuses_before_import():
     gmsh = pytest.importorskip("gmsh")
     gmsh.initialize()
     gmsh.option.setNumber("General.Terminal", 0)
@@ -186,17 +198,42 @@ def test_import_conductor_solid_faces_fuses_before_export():
         grp = _FakeGroup("Copper")
         cond_bodies = [(grp, _FakeSolid(b1, "Pin")), (grp, _FakeSolid(b2, "Trace"))]
 
-        result = _import_conductor_solid_faces(gmsh, cond_bodies, _log)
+        result = _import_conductor_solids(gmsh, cond_bodies, _log)
 
         # One entry for the one conductor group, regardless of how many
         # solids it contains.
         assert len(result) == 1
-        result_grp, surf_tags = result[0]
+        result_grp, vol_tags = result[0]
         assert result_grp is grp
-        # Fused+simplified box pair has 6 faces -- confirms the fuse ran
-        # before export rather than each solid's 6 faces being imported
-        # independently (which would give 12).
-        assert len(surf_tags) == 6
+        # The fused+simplified box pair imports as a single Gmsh volume --
+        # confirms the fuse ran before import, and that a genuine 3-D solid
+        # entered Gmsh rather than a bag of standalone 2-D faces.
+        assert len(vol_tags) == 1
+        assert gmsh.model.getEntities(3) == [(3, vol_tags[0])]
+    finally:
+        gmsh.finalize()
+
+
+def test_import_conductor_solids_imports_one_volume_per_disjoint_solid():
+    # A conductor group with several disjoint solids (e.g. many separate SMD
+    # contacts) must import as multiple volumes, one per solid -- not fused
+    # into a single entity, and not silently dropped.
+    gmsh = pytest.importorskip("gmsh")
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    try:
+        gmsh.model.add("test_disjoint_import")
+
+        b1 = Part.makeBox(1, 1, 1)
+        b2 = Part.makeBox(1, 1, 1, FreeCAD.Vector(10, 0, 0))
+        grp = _FakeGroup("SmdContacts")
+        cond_bodies = [(grp, _FakeSolid(b1, "A")), (grp, _FakeSolid(b2, "B"))]
+
+        result = _import_conductor_solids(gmsh, cond_bodies, _log)
+
+        assert len(result) == 1
+        _, vol_tags = result[0]
+        assert len(vol_tags) == 2
     finally:
         gmsh.finalize()
 
@@ -321,5 +358,223 @@ def test_apply_refinement_fields_returns_true_when_a_group_size_is_set():
         )
 
         assert applied is True
+    finally:
+        gmsh.finalize()
+
+
+# _update_vol_physical_groups_after_fragment() rebuilds each material's Gmsh
+# physical-volume group after occ.fragment() invalidates it. In production,
+# on a document with six material groups, Gmsh's addPhysicalGroup() raised
+# "Physical volume 1 already exists" immediately after removePhysicalGroups()
+# had supposedly cleared that same tag -- a rare Gmsh OCC bookkeeping quirk,
+# not reproducible with a handful of boxes in isolation. The rebuild must
+# retry once instead of letting that exception abort the whole mesh.
+
+class _FakeGmshModel:
+    def __init__(self, fail_once_tags=()):
+        self._fail_once = set(fail_once_tags)
+        self.physical_groups = {}   # (dim, tag) -> [vols]
+        self.names = {}             # (dim, tag) -> name
+
+    def getPhysicalGroups(self, dim):
+        return [(dim, tag) for (d, tag) in self.physical_groups if d == dim]
+
+    def removePhysicalGroups(self, dim_tags):
+        for dt in dim_tags:
+            self.physical_groups.pop(dt, None)
+
+    def addPhysicalGroup(self, dim, vols, tag):
+        if tag in self._fail_once:
+            self._fail_once.discard(tag)
+            raise Exception(f"Physical volume {tag} already exists")
+        self.physical_groups[(dim, tag)] = list(vols)
+        return tag
+
+    def setPhysicalName(self, dim, tag, name):
+        self.names[(dim, tag)] = name
+
+
+class _FakeGmsh:
+    def __init__(self, fail_once_tags=()):
+        self.model = _FakeGmshModel(fail_once_tags)
+
+
+def test_update_vol_physical_groups_retries_once_on_stale_tag_collision():
+    gmsh = _FakeGmsh(fail_once_tags={1})
+    old_vol_tags = [2, 3]
+    out_map = [[(3, 2)], [(3, 3)]]
+    vol_pg_info = {
+        1: ("Airbox_Background", frozenset({2})),
+        2: ("Dielectric_2", frozenset({3})),
+    }
+
+    _update_vol_physical_groups_after_fragment(
+        gmsh, old_vol_tags, out_map, vol_pg_info, log_fn=_log)
+
+    assert gmsh.model.physical_groups[(3, 1)] == [2]
+    assert gmsh.model.physical_groups[(3, 2)] == [3]
+    assert gmsh.model.names[(3, 1)] == "Airbox_Background"
+    assert gmsh.model.names[(3, 2)] == "Dielectric_2"
+
+
+def test_update_vol_physical_groups_skips_group_that_still_collides_after_retry():
+    gmsh = _FakeGmsh(fail_once_tags=set())
+    gmsh.model.addPhysicalGroup = mock.Mock(
+        side_effect=Exception("Physical volume 1 already exists"))
+    old_vol_tags = [2, 3]
+    out_map = [[(3, 2)], [(3, 3)]]
+    vol_pg_info = {
+        1: ("Airbox_Background", frozenset({2})),
+        2: ("Dielectric_2", frozenset({3})),
+    }
+
+    # Must not raise -- a group that still collides after the retry is
+    # skipped (with a warning), not allowed to abort the whole mesh.
+    _update_vol_physical_groups_after_fragment(
+        gmsh, old_vol_tags, out_map, vol_pg_info, log_fn=_log)
+
+    assert (3, 1) not in gmsh.model.physical_groups
+    assert (3, 2) not in gmsh.model.physical_groups
+
+
+# _assign_material_physical_groups() fragments the airbox with all dielectric
+# solids together. Two dielectric solids from *different* groups can overlap
+# in the CAD model (e.g. a broad fill/substrate a smaller, more specific
+# dielectric sits inside without a pre-cut cavity) -- fragment() then puts the
+# shared sub-volume in both groups' output. A production document hit exactly
+# this: a "PTFE" fill's claimed volumes fully swallowed a smaller "FR-4"
+# board's, leaving Airbox_Background with zero volumes. Contested tags must
+# resolve to exactly one group (the smaller solid), not both.
+
+def test_assign_material_physical_groups_resolves_dielectric_overlap_by_size(tmp_path):
+    gmsh = pytest.importorskip("gmsh")
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    try:
+        gmsh.model.add("test_diel_overlap")
+
+        airbox_shape = Part.makeBox(20, 20, 20, FreeCAD.Vector(-10, -10, -10))
+        big_shape    = Part.makeBox(8, 8, 8, FreeCAD.Vector(0, 0, 0))     # PTFE-like fill
+        small_shape  = Part.makeBox(2, 2, 2, FreeCAD.Vector(1, 1, 1))    # FR-4-like, inside big_shape
+
+        step_path = str(tmp_path / "geom.step")
+        Part.makeCompound([airbox_shape, big_shape, small_shape]).exportStep(step_path)
+
+        gmsh.model.occ.importShapes(step_path)
+        gmsh.model.occ.synchronize()
+        all_vol_tags_before = [t for _, t in gmsh.model.getEntities(3)]
+        assert len(all_vol_tags_before) == 3
+
+        airbox_obj = _FakeSolid(airbox_shape, "Airbox")
+        big_grp = _FakeGroup("PTFE")
+        big_grp.MeshAttribute = 3
+        small_grp = _FakeGroup("FR-4")
+        small_grp.MeshAttribute = 2
+        diel_bodies = [
+            (big_grp, _FakeSolid(big_shape, "PTFE_solid")),
+            (small_grp, _FakeSolid(small_shape, "FR4_solid")),
+        ]
+
+        warnings = []
+        _assign_material_physical_groups(
+            gmsh, warnings.append, airbox_obj, diel_bodies, all_vol_tags_before)
+
+        vols_by_attr = {}
+        for _, pg_tag in gmsh.model.getPhysicalGroups(3):
+            vols_by_attr[pg_tag] = set(gmsh.model.getEntitiesForPhysicalGroup(3, pg_tag))
+
+        assert not (vols_by_attr.get(2, set()) & vols_by_attr.get(3, set()))
+        assert vols_by_attr.get(2)          # smaller solid (FR-4) keeps the contested region
+        assert vols_by_attr.get(1)          # background survives -- not swallowed whole
+        assert any("overlap" in w.lower() for w in warnings)
+    finally:
+        gmsh.finalize()
+
+
+# A dielectric group can legitimately have several child solids that end up
+# as separate-but-touching Gmsh volumes after the material fragment (either
+# because the user put multiple adjacent bodies in one group, or because the
+# overlap resolution above leaves a group's "remainder" split into pieces
+# that happen to touch elsewhere). The boundary between two same-attribute
+# fragments is physically meaningless but still a real Gmsh surface, and one
+# production document crashed mesh.generate(3) ("Invalid boundary mesh") when
+# such a boundary landed exactly tangent to a later-imported conductor face.
+# _assign_material_physical_groups() must fuse same-attribute adjacent
+# fragments into one volume so that spurious boundary never reaches mesh
+# generation; fragments that don't actually touch must be left alone.
+
+def test_assign_material_physical_groups_fuses_touching_same_group_fragments(tmp_path):
+    gmsh = pytest.importorskip("gmsh")
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    try:
+        gmsh.model.add("test_diel_fuse_touching")
+
+        airbox_shape = Part.makeBox(20, 20, 20, FreeCAD.Vector(-10, -10, -10))
+        # Two boxes sharing the face at X=0 -- touching, not overlapping.
+        left_shape  = Part.makeBox(5, 5, 5, FreeCAD.Vector(-5, -2.5, -2.5))
+        right_shape = Part.makeBox(5, 5, 5, FreeCAD.Vector(0, -2.5, -2.5))
+
+        step_path = str(tmp_path / "geom.step")
+        Part.makeCompound([airbox_shape, left_shape, right_shape]).exportStep(step_path)
+
+        gmsh.model.occ.importShapes(step_path)
+        gmsh.model.occ.synchronize()
+        all_vol_tags_before = [t for _, t in gmsh.model.getEntities(3)]
+        assert len(all_vol_tags_before) == 3
+
+        airbox_obj = _FakeSolid(airbox_shape, "Airbox")
+        grp = _FakeGroup("FR-4")
+        grp.MeshAttribute = 2
+        diel_bodies = [
+            (grp, _FakeSolid(left_shape, "FR4_left")),
+            (grp, _FakeSolid(right_shape, "FR4_right")),
+        ]
+
+        logged = []
+        _assign_material_physical_groups(
+            gmsh, logged.append, airbox_obj, diel_bodies, all_vol_tags_before)
+
+        diel_vols = gmsh.model.getEntitiesForPhysicalGroup(3, 2)
+        assert len(diel_vols) == 1, (
+            "touching same-attribute fragments must be fused into one volume")
+        assert any("Fused 2 same-material fragment" in msg for msg in logged)
+    finally:
+        gmsh.finalize()
+
+
+def test_assign_material_physical_groups_leaves_disjoint_same_group_fragments(tmp_path):
+    gmsh = pytest.importorskip("gmsh")
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    try:
+        gmsh.model.add("test_diel_fuse_disjoint")
+
+        airbox_shape = Part.makeBox(20, 20, 20, FreeCAD.Vector(-10, -10, -10))
+        # Two boxes on opposite sides of the airbox -- never touch.
+        left_shape  = Part.makeBox(2, 2, 2, FreeCAD.Vector(-8, -1, -1))
+        right_shape = Part.makeBox(2, 2, 2, FreeCAD.Vector(6, -1, -1))
+
+        step_path = str(tmp_path / "geom.step")
+        Part.makeCompound([airbox_shape, left_shape, right_shape]).exportStep(step_path)
+
+        gmsh.model.occ.importShapes(step_path)
+        gmsh.model.occ.synchronize()
+        all_vol_tags_before = [t for _, t in gmsh.model.getEntities(3)]
+        assert len(all_vol_tags_before) == 3
+
+        airbox_obj = _FakeSolid(airbox_shape, "Airbox")
+        grp = _FakeGroup("SmdCeramic")
+        grp.MeshAttribute = 4
+        diel_bodies = [
+            (grp, _FakeSolid(left_shape, "Smd_left")),
+            (grp, _FakeSolid(right_shape, "Smd_right")),
+        ]
+
+        _assign_material_physical_groups(
+            gmsh, _log, airbox_obj, diel_bodies, all_vol_tags_before)
+
+        diel_vols = gmsh.model.getEntitiesForPhysicalGroup(3, 4)
+        assert len(diel_vols) == 2, "disjoint fragments must not be merged"
     finally:
         gmsh.finalize()

@@ -36,12 +36,12 @@ class CmdImpedanceBoundary:
                 elif sub.startswith("Face"):
                     face_refs.append((s.Object, [sub]))
 
-        from features import next_port_index
+        from features import next_impedance_index
         from features.impedance_boundary import create_impedance_boundary
         from panels.impedance_boundary_panel import ImpedanceBoundaryPanel
         from panels import show_palace_panel
 
-        idx = next_port_index(doc)
+        idx = next_impedance_index(doc)
 
         if len(edge_refs) == 2:
             obj = create_impedance_boundary(doc, index=idx, edge_refs=edge_refs)

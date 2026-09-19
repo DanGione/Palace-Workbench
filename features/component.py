@@ -63,7 +63,8 @@ propagation will misalign for every entry after the removed one.
 
 import os
 
-from features import find_dielectric_groups, find_conductor_groups
+from features import find_dielectric_groups, find_conductor_groups, find_component_group
+from features.object_group import add_to_component_group, cleanup_group_if_orphaned
 
 _ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "Component.svg")
 _SMD_ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "SMDComponent.svg")
@@ -270,6 +271,7 @@ def create_component_container(doc, kind, base_name="Component", proxy_cls=Compo
     obj.ComponentKind = kind
     if obj.ViewObject is not None:
         ViewProviderComponent(obj.ViewObject)
+    add_to_component_group(doc, obj)
     return obj
 
 
@@ -359,6 +361,12 @@ def delete_component_children(doc, container):
     for grp in candidate_groups:
         if grp.Name in still_live and len(grp.Group) == 0:
             doc.removeObject(grp.Name)
+
+    # Same "delete if now empty" treatment for the document's ComponentGroup
+    # -- container is still live and still a member at this point (removed
+    # by FreeCAD right after this function returns), matching
+    # cleanup_group_if_orphaned's calling convention exactly.
+    cleanup_group_if_orphaned(doc, find_component_group, container)
 
 
 def delete_component(doc, container):

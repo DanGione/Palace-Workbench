@@ -1,8 +1,10 @@
 # Palace Workbench — Developer Context
 
 FreeCAD 1.0 Python workbench for EM simulation via the Palace solver (AWS Labs).
-Docker-first: images published to GHCR. No test suite — verified by running the
-container and exercising the GUI.
+Docker-first: images published to GHCR. `tests/` has `pytest` coverage for the
+pure-Python logic in `palace/` and `features/`; GUI-dependent behavior (panels,
+tree rendering, ViewProvider hooks) has no automated coverage and is still
+verified by running the container and exercising the GUI directly.
 
 ## File Layout
 
@@ -12,11 +14,16 @@ container and exercising the GUI.
 | `commands/cmd_run.py` | Orchestrates single simulations |
 | `commands/cmd_sweep.py` | Orchestrates parameter sweeps and optimization |
 | `features/` | FreeCAD `DocumentObject` definitions (App-layer) |
+| `features/object_group.py` | Auto-managed tree groups for Ports/Impedance Boundaries/Components — no command or panel, see the invariant below |
 | `panels/` | Qt task panels shown in the FreeCAD sidebar |
 | `palace/` | Palace helpers: config, meshing, result parsing, NetCDF4 serialization |
+| `palace/meshing.py` | Gmsh meshing backend |
+| `palace/netgen_meshing.py` | Netgen meshing backend (alternative engine, see `MeshBackend` below) |
+| `palace/mesh_dispatch.py` | The one place that picks Gmsh vs. Netgen per `Simulation.MeshBackend` — every call site imports `generate_mesh` from here, never directly from `palace.meshing`/`palace.netgen_meshing` |
 | `palace/results_db.py` | xarray/NetCDF4 read/write; `append_sweep_point` concatenates sweep runs |
 | `palace/embedded_files.py` | Wraps `App::PropertyFileIncluded` so generated artifacts live inside the `.FCStd` |
 | `docs/` | End-user markdown docs (rendered on GitHub) |
+| `tests/` | `pytest` coverage for `palace/`/`features/`, mirroring the source layout |
 
 ## Output File Layout
 
@@ -92,6 +99,80 @@ this hook, deleting an SMDComponent (or any Component) via the tree only
 removed the container, orphaning everything else. Because the cascade runs
 inside FreeCAD's own Delete-command transaction (not a bare scripted
 `removeObject`), a subsequent Undo restores every cascaded object too.
+
+### Auto-managed tree groups for Ports/Impedance Boundaries/Components — `features/object_group.py`
+Three document-singleton container objects (`PortGroup` holding both WavePort
+and LumpedPort, `ImpedanceBoundaryGroup`, `ComponentGroup`) declutter the tree
+once a document accumulates several ports/components, mirroring
+`DielectricGroup`/`ConductorGroup`'s `App::FeaturePython` +
+`App::GroupExtensionPython` + `ViewProvider.claimChildren()` pattern
+(`features/material_group.py`). Unlike material groups, these have **no
+command, no toolbar entry, and no task panel** — deliberately, per explicit
+user direction: a group springs into existence via `get_or_create_*_group(doc)`
+the moment a matching object is created (`features/wave_port.py`/
+`lumped_port.py`/`impedance_boundary.py`/`component.py` all call
+`add_to_port_group`/`add_to_impedance_boundary_group`/`add_to_component_group`
+instead of the old `add_to_simulation`), and is deleted again by
+`cleanup_group_if_orphaned()` once its last member is removed (called from
+each member's own `ViewProvider.onDelete` — WavePort/LumpedPort/
+ImpedanceBoundary gained an `onDelete` for exactly this; Component's existing
+`delete_component_children()` gained one more call for the same purpose,
+alongside its pre-existing material-group cleanup).
+
+**FreeCAD's `Group` property does NOT enforce single-parent membership** — an
+object can be listed in two different containers' `Group` lists at once, and
+the tree renders it under both. Confirmed on a real board: four
+SMD-component-derived `ImpedanceBoundary` objects were stale direct members of
+`PalaceSimulation.Group` (left over from before `_is_palace_child` was trimmed
+below) *in addition to* correctly joining the new group, so each rendered
+twice. `_add_member()` strips stale `Simulation.Group` membership before
+adding to the real group; `sync_all_groups()` (called from
+`SimulationContainer.onDocumentRestored`, `features/simulation.py`) re-sweeps
+this **unconditionally on every restore**, not just when a group doesn't
+exist yet — a document can already have both the group and the stale
+duplicate baked in, and `get_or_create_*_group`'s own sweep only runs on
+first creation, so only the unconditional restore-time pass self-heals it.
+
+`features/simulation.py`'s `_is_palace_child()` (used by `_migrate_to_group`,
+the pre-existing "sweep loose Palace objects into `Simulation.Group`"
+migration) no longer matches LumpedPort/WavePort/ImpedanceBoundary — they have
+their own group one level deeper now. Component was never in there to begin
+with; `sync_all_groups` is its only grouping path.
+
+### Port `Label` locked to `PortIndex` — `features/wave_port.py`, `features/lumped_port.py`
+A port's `Label` used to be set once at creation
+(`f"PalaceWavePort{index}"`/`f"PalaceLumpedPort{index}"`) and never touched
+again. On a real board, enough create/delete/edit cycles left `Name`,
+`Label`, and `PortIndex` all showing different numbers on the same object
+(`Name="PalaceWavePort009"`, `Label="PalaceWavePort002"`, `PortIndex=2`).
+`Label` is now always exactly `f"Port {PortIndex}"` — deliberately identical
+between WavePort and LumpedPort, since they share one numbering sequence
+(`next_port_index()` in `features/__init__.py` already combined both types
+into a single counter; only the *display* was inconsistent, not the
+underlying index). `onChanged()` re-derives `Label` whenever `PortIndex`
+changes, mirroring the pre-existing `MeshAttribute = 10 + PortIndex` sync in
+the same method; `onDocumentRestored()` re-applies it unconditionally too, so
+an already-drifted document self-heals on next open. `ImpedanceBoundary` is
+deliberately NOT included — it has its own separate numbering range
+(`_IMPEDANCE_INDEX_BASE = 1000`) and "Port 1000" would be a nonsensical label.
+
+### SMD component re-edit must preserve `Label` — `panels/smd_component_panel.py`
+`SMDComponentPanel.accept()` re-edits an existing component by fully deleting
+the old container (`delete_smd_component`) and building a brand-new one from
+scratch (`create_smd_component`) rather than patching properties in place —
+intentional, to avoid per-field diffing (see the code comment). But the new
+container is a fresh `doc.addObject("SMDComponent")` every time, and
+FreeCAD's internal Name-uniqueness counter for that base name is monotonic
+and never reuses a suffix freed by deletion — so the visible name silently
+climbed on every single re-edit (confirmed: `SMDComponent002` →
+`SMDComponent005` after just one edit) if nothing restored the old `Label`
+afterward. `accept()` now captures `self.existing.Label` before deleting and
+reassigns it to `new_container.Label` after creating the replacement — same
+technique already used there for `PortIndex` (captured from the old
+`ImpedanceBoundaryObj` before delete, reused when calling
+`create_smd_component`). The generic (non-SMD) `Component` panel
+(`panels/component_panel.py`) does **not** have this problem — it patches the
+existing container in place via `_apply_edits()`, never deletes/recreates it.
 
 ### Live results panel signal — `commands/cmd_sweep.py`, `panels/sweep_results_panel.py`
 `_iter_emitter` is a module-level `QObject` singleton in `cmd_sweep.py` that emits
@@ -172,9 +253,212 @@ common case, since most driven runs excite a single port). `_on_done()`'s
 `final_csv` path is derived from `passes[0][1]` for the same reason, rather than
 assuming a hardcoded `"output"`.
 
+### Volume physical-group rebuild retries on stale Gmsh tag collisions — `palace/meshing.py`
+`_update_vol_physical_groups_after_fragment()` re-registers each material's Gmsh
+physical-volume group (attr 1 = airbox, `grp.MeshAttribute` per dielectric —
+fixed numbers, since `palace/config.py`'s `Domains["Materials"]` block
+references them by exact number) after the port/conductor `occ.fragment()`
+pass, because `occ.synchronize()` silently invalidates physical groups whose
+member entities were touched by a fragment. It removes and re-adds each group
+individually (not one batch removal followed by a separate add loop) and
+retries once if `addPhysicalGroup()` raises `"Physical volume N already
+exists"` — a Gmsh OCC bookkeeping quirk where a group can still be reported as
+present immediately after `removePhysicalGroups()` supposedly cleared it. Only
+observed once a real document reached six material groups (16 fragment
+volumes); not reproducible with a handful of boxes in an isolated gmsh script,
+so treat it as an occasional Gmsh edge case rather than a deterministic bug to
+fully root-cause. If a group still collides after the retry, it's skipped with
+a `Palace: WARNING —` log line instead of aborting the whole mesh — one bad
+material group shouldn't kill an otherwise-good mesh.
+
+### Conductors are imported as volumes, then removed, not as bare faces — `palace/meshing.py`
+`_import_conductor_solids()` imports each conductor group's fused shape into
+Gmsh as a genuine OCC **volume** (one per disjoint solid), and
+`generate_mesh()` includes it as an *object* — alongside the airbox/dielectric
+volumes — in the combined port+conductor `occ.fragment()` pass, not as a 2-D
+tool surface. This replaced an earlier approach
+(`_import_conductor_solid_faces`, since removed) that imported only a
+conductor's individual faces and relied on `occ.fragment()` to *infer* an
+enclosed cavity from that loose, disconnected set. That inference was
+confirmed unreliable on a real production document: checking Gmsh topology
+adjacency directly (`getAdjacencies`) right after the fragment showed **100%**
+of every conductor's own faces bounding either zero volumes (dangling) or two
+*dielectric* volumes (absorbed into a coincident dielectric/dielectric
+interface instead of becoming the conductor's own boundary) — both of which
+leave boundary triangles with no adjacent tetrahedron, aborting Palace's MFEM
+solver immediately (`STable3D` `operator()` assertion) despite meshing itself
+completing without error. Importing the whole solid lets OCC's boolean kernel
+actually carve the cavity; `getBoundary(combined=True)` then gives the true
+outer skin, and the now-unlabeled interior volume is removed
+(`gmsh.model.occ.remove(..., recursive=False)`) before mesh generation so it's
+never meshed as a domain (Palace treats it as a PEC surface, not a region).
+
+Two more things had to be handled once conductors became real volumes:
+- **Conductor/conductor contact** (e.g. an SMD contact pad soldered onto a
+  copper trace — two *different* conductor groups physically touching) leaves
+  a face whose only two neighbors are conductor interiors, not one conductor
+  plus real material. `getBoundary(combined=True)` cannot always fully cancel
+  this out (same-group self-touching pieces from a conductor split by a
+  heavily-fragmented dielectric region hit the identical symptom). Both are
+  caught the same way: right before assigning a candidate boundary face to a
+  group's PEC physical group, check its live `getAdjacencies()` — a genuine
+  conductor boundary bounds exactly 2 volumes at that point (this conductor's
+  own interior, not yet removed, plus real surrounding material), with
+  neither side present in the *global* set of every conductor group's
+  interior volumes. A face that fails is simply left untagged (no physical
+  group → never written to the `.msh`, since `Mesh.SaveAll=0` by default) —
+  dropping a handful of PEC surfaces at an already electrically-continuous
+  junction is far cheaper than a hard Palace abort. **Do not** try to fix
+  this by re-fusing a conductor group's own post-fragment volume pieces
+  (`occ.fuse()` + `synchronize()`) before computing the boundary — tried once
+  empirically and it made things dramatically worse (a previously-clean
+  28-solid conductor group went from 0% to 72% orphaned), because the extra
+  `occ.synchronize()` mid-loop silently renumbers/invalidates volume tags for
+  conductor groups not yet processed in the same pass — the same class of
+  surprise `occ.fragment()`+`synchronize()` already causes for physical
+  groups (see the invariant above).
+- A conductor face coincident with a port's own plane (needed to avoid a
+  separate triple-edge MFEM crash — see `cond_skip_planes` in
+  `generate_mesh()`) is now excluded by a plane-membership check *after* the
+  fragment, not by skipping the face at import time — the whole conductor
+  solid must stay intact (a single watertight shape) for the boolean fragment
+  to correctly carve its cavity.
+
+As an unexpected bonus, this fix also resolved a second, seemingly unrelated
+symptom on the same document: the outer PEC boundary and one wave port had
+**100%** of their own elements orphaned too, despite passing
+`_assign_outer_boundary_groups()`'s own "bounds exactly 1 volume" filter —
+that volume turned out to be one of the conductor's never-removed ghost
+interior volumes. Once conductor interiors are properly removed before mesh
+generation, this resolved to 0 orphans as a side effect, confirming it was a
+downstream symptom of the same root cause rather than an independent bug.
+
+**A regression this change introduced, only caught by testing other real
+documents, not just the one being fixed**: planar/wave port physical-group
+assignment (`planar_port_surf_list`/`wave_port_surf_list` in
+`generate_mesh()`) builds a port's final surface tags straight from the
+fragment's old→new map with no adjacency check at all — previously safe,
+because conductors contributed no volume for a port face to be fragmented
+against. Once conductors became fragment objects, a port face that
+physically overlaps a conductor passing through it (the ordinary case for a
+coaxial wave port wrapped around its own center conductor) gets a sliver
+fragmented against the conductor's cavity instead of real background
+material; that sliver was still being claimed by the port group, then
+orphaned once the conductor's interior was removed. Confirmed as a true
+regression (not pre-existing) by running the *original*, pre-fix
+`_import_conductor_solid_faces`-based code — extracted via
+`git show HEAD:palace/meshing.py` — against the same affected documents and
+finding 0 orphans there. Fixed the same way as the conductor-side cases
+above: `_touches_cond_interior()` rejects any candidate port surface
+adjacent to the (still global, not-yet-removed) set of every conductor's
+interior volume, applied in both the planar and wave port assignment loops;
+resolving conductor volumes and building that global set now happens right
+after `_update_vol_physical_groups_after_fragment()`, before port
+assignment, instead of down in the conductor assignment block, since ports
+are assigned first and need the set already built. This is also a
+correctness improvement over the pre-fix behavior, not just a defect
+avoidance: the old code silently meshed the port-face area actually
+occupied by the conductor as if it were open aperture (vacuum/dielectric),
+since conductors never had real volume to displace it — the new behavior
+correctly excludes that area from the port instead.
+
+Verified against every example `.FCStd` committed to this repo (filters,
+splitters, microstrip, coax-to-microstrip) plus the two files this
+investigation started from — 0 orphaned elements on every one that could
+mesh at all (one file, `SM06FS012.FCStd`, fails for an unrelated,
+pre-existing reason: no Airbox shape assigned).
+
+### Netgen meshing backend — `palace/netgen_meshing.py`, `palace/mesh_dispatch.py`
+A second meshing engine, selected per-document via `Simulation.MeshBackend`
+(`"Gmsh"` default or `"Netgen"`) and dispatched through the single choke
+point `palace/mesh_dispatch.py:generate_mesh()` — every call site
+(`commands/cmd_run.py`, `palace/mesh_worker_main.py`) imports `generate_mesh`
+from there, never from `palace.meshing`/`palace.netgen_meshing` directly.
+`palace/meshing.py` (Gmsh) is untouched by this; the two backends share
+nothing but the `(mesh_path, geometry_path, quality)` return contract, the
+Gmsh MSH2 output format, and each source object's own `MeshAttribute`
+numbering (`palace/config.py` needs zero backend-specific logic). Reused
+directly from `palace/meshing.py`: `_collect_material_bodies`,
+`_fuse_group_solids`, airbox-solid resolution. Domain identity uses COM+volume
+matching (`_match_reference`), not `.name`/`.mat` propagation — `Glue()` does
+not reliably preserve per-solid names through *nested* containment (airbox
+containing dielectric containing conductor, this workbench's actual geometry
+model). Boundary-condition tagging uses `.bc()` on the pre-mesh OCC faces
+(ports tagged after conductors, so ports win on any overlap), read back after
+meshing via `FaceDescriptor.bcname`/`.domin`/`.domout` — no post-mesh
+`getAdjacencies()`-style querying needed the way Gmsh's `_touches_cond_interior`
+requires, since Netgen exposes domain adjacency on the descriptor directly.
+`netgen-mesher` runs inside the *same* `freecadcmd` subprocess Gmsh already
+used (`palace/mesh_runner.py`/`mesh_worker_main.py`) — no separate venv
+needed, confirmed by installing it alongside `gmsh` in the same `pip install`
+line with no conflict.
+
+Three real, production-confirmed bugs fixed here that must not regress:
+
+- **Internal material-interface faces must never inherit the outer-boundary
+  default.** A `FaceDescriptor` nobody explicitly `.bc()`-tagged keeps
+  Netgen's own `"default"` bcname; the fallback logic used to apply the
+  airbox's `OuterBoundaryType` (typically PEC) to *every* such face,
+  including ones where `domout != 0` — i.e. a real kept domain on **both**
+  sides, a genuine internal interface (e.g. dielectric/air), not an exterior
+  wall. This PEC-shorted the tangential E-field across that entire interface
+  board-wide, not locally — the direct cause of a real "S-parameters imply
+  the board is a shorted mess" report. Fixed by checking
+  `fd.domout != 0` and dropping those elements entirely from the exported
+  mesh (`drop_surfnrs` in `_rewrite_physical_tags`) rather than tagging them
+  — Palace applies domain continuity automatically there, matching
+  `palace.meshing`'s own `_assign_outer_boundary_groups` exclusion of
+  two-volume-adjacent surfaces.
+- **`_match_occ_faces` needs both an area cap and a flatness check**, not
+  just its documented relative plane-distance tolerance. A large, unrelated
+  fragment (the rest of an airbox wall) can have its centroid coincidentally
+  land inside a small target face's footprint by pure geometric symmetry —
+  rejected by capping a candidate's own area at ~1.05× the target's (a true
+  sub-fragment can never exceed the original face's area). Separately, a
+  *perpendicular* face (e.g. a thin lumped-port box's vertical side wall) can
+  have its centroid sit within the plane-distance tolerance purely because
+  the box is short — rejected by requiring every one of the candidate's own
+  vertices, not just its centroid, to lie within a small **fixed** (not
+  area-scaled) tolerance of the target's plane. Full reasoning for both,
+  plus the original annular-port centroid-mismatch case the scaled tolerance
+  exists for, is in the function's own docstring — read it before touching
+  this function again.
+- **`_wave_port_boundary_edges` (the Netgen equivalent of `palace.meshing`'s
+  `PortBoundaryCurves`) must NOT exclude conductor-adjacent edges.** It once
+  did, by analogy with Gmsh's `cond_skip_planes` — but that analogy was
+  wrong: Gmsh excludes a *conductor's own face* from PEC tagging where it
+  coincides with a port plane (avoiding a triple-edge MFEM conflict specific
+  to its fragment-based topology), never the port's own boundary curve,
+  which always gets the full outer-boundary treatment regardless of what it
+  touches. Netgen's `.bc()` tagging makes ports win over conductors before
+  meshing, so there's only ever one 2-D triangle at that location — the
+  triple-edge conflict Gmsh avoids doesn't arise here, and excluding those
+  edges just starved the wave-port eigenmode problem of a boundary condition
+  it needed, producing a near-fully-evanescent (non-propagating) computed
+  mode instead of the correct quasi-TEM one.
+
+### TE/TM field-probe grid must be clipped to the port face's real shape — `palace/config.py`
+`_probe_grid_over_port_face()` (used only for wave ports with no
+`IntegrationEdge`, i.e. the TE/TM Poynting-flux fallback — see the `Z_PV`
+invariant above) grids the port face's **bounding box**, not its actual
+shape. For a non-rectangular face (e.g. an annular coax port), a fraction of
+those points always land inside the unmeshed center-conductor hole or
+outside the outer wall — reported by Palace at runtime as "Probe N could not
+be found! Using default value 0.0." Purely cosmetic (the TE/TM impedance
+formula is a ratio of two sums, so a zero-valued point contributes zero to
+both and doesn't bias the ratio) but real log noise. Fixed by filtering the
+grid to points that actually lie on the bounded face, via the same
+`distToShape`-against-`Part.Vertex` containment check already established in
+`palace/meshing.py`'s `_faces_within_freecad_face` and
+`palace/netgen_meshing.py`'s `_match_occ_faces` — both of which document why
+`Part.Face.isInside()` is avoided (unreliable on a naked, non-solid face).
+Falls back to the unfiltered grid if filtering would remove every point, so
+this can never produce fewer usable probes than before.
+
 ## Dependencies
 
-- **Runtime:** `matplotlib`, `numpy`, `xarray`, `netCDF4`, `gmsh` (lazy-loaded)
+- **Runtime:** `matplotlib`, `numpy`, `xarray`, `netCDF4`, `gmsh`, `netgen-mesher`
+  (both meshing backends lazy-loaded; see `palace/mesh_dispatch.py`)
 - **Environment:** FreeCAD 1.0, Palace binary, Python 3.11
 - **Docker:** `ghcr.io/dangione/palace-workbench:latest` (main) / `:dev` (dev branch)
 

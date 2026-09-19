@@ -8,6 +8,10 @@ This guide walks you through opening a working example, running your first simul
 
 ## 1. Open the example file
 
+Copy `examples/Microstrip_test_new.FCStd` from this repository into your
+local `projects/` folder (the one you mapped next to `docker-compose.yml` —
+see the Quick Start's step 4 in the README).
+
 Inside the FreeCAD window:
 
 1. Go to **File → Open**.
@@ -33,11 +37,11 @@ The model tree shows:
 | Object | What it is |
 |---|---|
 | **Body** / **Sketch** | The geometry (substrate, trace, ground plane) |
-| **PalaceSimulation** | Solver settings — frequency range, type, binary path |
+| **PalaceSimulation** | Solver settings — frequency range, type, binary path. Everything else below normally nests under this in the tree. |
 | **PalaceAirbox** | The simulation domain (a box surrounding the structure) |
-| **PalaceLumpedPort_1 / _2** | Port definitions at each end of the transmission line |
-| **PalaceConductor_...** | Metal conductor material assignments |
-| **PalaceDielectric_...** | Substrate material assignment |
+| **Ports** → **Port 1** / **Port 2** | Port definitions at each end of the transmission line, labeled by their port index. Once a model has more than a couple of ports they're automatically collected into this group — see [Ports Reference → Tree organization](ports-reference.md#tree-organization). |
+| **PalaceConductor...** | Metal conductor material assignments |
+| **PalaceDielectric...** | Substrate material assignment |
 | **PalaceMesh** | Mesh settings |
 
 Double-clicking any Palace object opens its settings panel.
@@ -50,6 +54,7 @@ Double-click **PalaceSimulation**. Under the **General** tab, confirm:
 
 - **Palace binary** points to `/usr/local/bin/palace` (pre-set in the Docker image). If you are running natively you must set this path yourself.
 - **Length scale L0** is `0.001` (millimetres).
+- **Backend** (in the Mesh group) — `Gmsh` by default. See [Simulation Reference → Choosing a mesh backend](simulation-reference.md#choosing-a-mesh-backend) if you want to try `Netgen` instead; no changes needed for this walkthrough.
 
 Under the **Frequencies** tab:
 

@@ -47,6 +47,27 @@ def find_components(doc):
             if hasattr(obj, "ChildBasePlacements") and hasattr(obj, "ComponentKind")]
 
 
+def find_port_group(doc):
+    for obj in doc.Objects:
+        if hasattr(obj, "IsPortGroup"):
+            return obj
+    return None
+
+
+def find_impedance_boundary_group(doc):
+    for obj in doc.Objects:
+        if hasattr(obj, "IsImpedanceBoundaryGroup"):
+            return obj
+    return None
+
+
+def find_component_group(doc):
+    for obj in doc.Objects:
+        if hasattr(obj, "IsComponentGroup"):
+            return obj
+    return None
+
+
 def find_impedance_boundaries(doc):
     objs = [obj for obj in doc.Objects
             if hasattr(obj, "Rs") and hasattr(obj, "MeshAttribute")]
@@ -67,12 +88,34 @@ def get_available_s_params(doc):
     return [(i, j) for j in excited for i in all_idx]
 
 
+_IMPEDANCE_INDEX_BASE = 1000
+
+
 def next_port_index(doc):
-    all_ports = (find_lumped_ports(doc) + find_wave_ports(doc)
-                 + find_impedance_boundaries(doc))
+    """Next PortIndex for a new excitation port (LumpedPort/WavePort).
+
+    Impedance boundaries are deliberately excluded (see next_impedance_index)
+    so stimulus ports always start at 1 and number contiguously among
+    themselves, regardless of how many impedance boundaries exist or when
+    they were created.
+    """
+    all_ports = find_lumped_ports(doc) + find_wave_ports(doc)
     if not all_ports:
         return 1
     return max(p.PortIndex for p in all_ports) + 1
+
+
+def next_impedance_index(doc):
+    """Next PortIndex for a new ImpedanceBoundary.
+
+    Starts at _IMPEDANCE_INDEX_BASE, far above any realistic excitation port
+    count, so impedance boundaries never shift where LumpedPort/WavePort
+    numbering starts.
+    """
+    boundaries = find_impedance_boundaries(doc)
+    if not boundaries:
+        return _IMPEDANCE_INDEX_BASE
+    return max(_IMPEDANCE_INDEX_BASE, max(b.PortIndex for b in boundaries) + 1)
 
 
 def find_sweep(doc):

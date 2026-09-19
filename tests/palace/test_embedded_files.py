@@ -343,3 +343,46 @@ def test_migrate_legacy_string_property_no_file_leaves_property_empty(doc):
 
     assert obj.getTypeIdOfProperty("ConfigFile") == "App::PropertyFileIncluded"
     assert ef.resolve(obj, "ConfigFile") == ""
+
+
+def test_reap_orphaned_scratch_dirs_removes_matching_prefixes(tmp_path):
+    for name in ("palace_abc123", "palace_sweep_def456", "palace_opt_ghi789"):
+        d = tmp_path / name
+        d.mkdir()
+        _write(str(d / "port-S.csv"), "dummy")
+    unrelated_dir = tmp_path / "unrelated_dir"
+    unrelated_dir.mkdir()
+    unrelated_file = tmp_path / "palace_notadir.txt"
+    _write(str(unrelated_file), "not a directory")
+
+    removed = ef.reap_orphaned_scratch_dirs(base_dir=str(tmp_path))
+
+    assert len(removed) == 3
+    assert not (tmp_path / "palace_abc123").exists()
+    assert not (tmp_path / "palace_sweep_def456").exists()
+    assert not (tmp_path / "palace_opt_ghi789").exists()
+    assert unrelated_dir.is_dir()  # untouched -- doesn't match the palace_ prefix
+    assert unrelated_file.is_file()  # untouched -- not a directory, glob-matched or not
+
+
+def test_reap_orphaned_scratch_dirs_noop_when_nothing_matches(tmp_path):
+    (tmp_path / "unrelated.txt").write_text("hi")
+
+    removed = ef.reap_orphaned_scratch_dirs(base_dir=str(tmp_path))
+
+    assert removed == []
+
+
+def test_rmtree_or_warn_removes_directory(tmp_path):
+    target = tmp_path / "some_dir"
+    target.mkdir()
+    (target / "file.txt").write_text("data")
+
+    ef.rmtree_or_warn(str(target))
+
+    assert not target.exists()
+
+
+def test_rmtree_or_warn_does_not_raise_on_missing_path(tmp_path):
+    missing = tmp_path / "does_not_exist"
+    ef.rmtree_or_warn(str(missing))  # must not raise

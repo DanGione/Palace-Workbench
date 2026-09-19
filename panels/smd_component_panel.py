@@ -321,12 +321,21 @@ class SMDComponentPanel:
 
         # Re-editing: regenerate the whole component from scratch rather than
         # patching properties in place (no per-field diffing needed). Reuse
-        # the old PortIndex so port numbering doesn't shift.
+        # the old PortIndex so port numbering doesn't shift, and the old
+        # Label so the visible name doesn't drift either -- the new
+        # container is a brand-new doc.addObject("SMDComponent") every edit,
+        # and FreeCAD's own auto-uniquify counter for that base name never
+        # resets just because the old object was deleted, so leaving this
+        # unset let the displayed name silently climb (SMDComponent002 ->
+        # SMDComponent005 -> ...) on every single re-edit, most visibly once
+        # several components already shared a name and kept colliding.
         port_index = None
+        old_label = None
         if self.existing is not None:
             old_boundary = getattr(self.existing, "ImpedanceBoundaryObj", None)
             if old_boundary is not None:
                 port_index = old_boundary.PortIndex
+            old_label = self.existing.Label
             delete_smd_component(self.doc, self.existing)
 
         new_container = create_smd_component(
@@ -356,6 +365,9 @@ class SMDComponentPanel:
                 except Exception:
                     pass
         new_container.Placement = self.ghost.Placement
+
+        if old_label is not None:
+            new_container.Label = old_label
 
         if self.ghost.Name in [o.Name for o in self.doc.Objects]:
             self.doc.removeObject(self.ghost.Name)

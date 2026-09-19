@@ -282,7 +282,30 @@ def _probe_grid_over_port_face(port_obj, m_cols=12, n_rows=8):
             for v2 in a2_vals:
                 coord = {norm_ax: fixed_val, span_axes[0]: v1, span_axes[1]: v2}
                 pts.append((coord["X"], coord["Y"], coord["Z"]))
-        return pts, face.Area
+
+        # The grid above covers the face's bounding box, not its actual (possibly
+        # non-rectangular, e.g. annular coax) shape -- Palace reports "Probe N
+        # could not be found" for every point that lands outside the real face
+        # (e.g. inside a coax port's center-conductor hole, or beyond its outer
+        # radius), since those regions are deliberately unmeshed conductor
+        # material. Filter to points genuinely on the bounded face using the
+        # same distToShape containment check already relied on elsewhere in
+        # this codebase (palace/meshing.py's _faces_within_freecad_face,
+        # palace/netgen_meshing.py's _match_occ_faces) -- Part.Face.isInside()
+        # is deliberately avoided there (and here) since it calls
+        # BRepClass3d_SolidClassifier, meant for 3-D solid containment, and is
+        # unreliable on a naked Part.Face. Fall back to the unfiltered grid if
+        # filtering would remove every point (e.g. a degenerate face) so this
+        # can never produce fewer usable probes than before.
+        import FreeCAD
+        import Part
+        tol = 1e-4  # mm; points already sit exactly on the face's plane, so
+                    # this is a pure in-plane containment check
+        filtered = [
+            (x, y, z) for (x, y, z) in pts
+            if face.distToShape(Part.Vertex(FreeCAD.Vector(x, y, z)))[0] <= tol
+        ]
+        return (filtered or pts), face.Area
     except Exception:
         return [], 0.0
 

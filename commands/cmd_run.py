@@ -593,6 +593,8 @@ def _on_done(success, message, passes, needs_merge, sim,
     """
     CmdRun._coordinator = None  # allow a new run to start
 
+    from palace.embedded_files import rmtree_or_warn
+
     if not success:
         cancelled = "cancelled" in message.lower()
         if cancelled:
@@ -604,7 +606,14 @@ def _on_done(success, message, passes, needs_merge, sim,
         if console is not None:
             console.set_status("Cancelled" if cancelled else f"Failed: {message}")
         if tmp_dir and os.path.isdir(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            rmtree_or_warn(tmp_dir)
+        if on_complete is not None:
+            # A sweep/optimize iteration -- on_complete's own failure branch
+            # cleans up out_dir and advances/stops the run. Skip the modal
+            # dialog below: it would otherwise block an unattended sweep on
+            # every failed point waiting for someone to click OK.
+            on_complete(False, None)
+            return
         if not cancelled:
             QtWidgets.QMessageBox.critical(None, "Palace Error", message)
         return
@@ -638,7 +647,10 @@ def _on_done(success, message, passes, needs_merge, sim,
         except Exception as exc:
             FreeCAD.Console.PrintError(f"Palace: S-matrix merge failed: {exc}\n")
             if tmp_dir and os.path.isdir(tmp_dir):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                rmtree_or_warn(tmp_dir)
+            if on_complete is not None:
+                on_complete(False, None)
+                return
             QtWidgets.QMessageBox.warning(
                 None,
                 "Palace Warning",
@@ -756,7 +768,7 @@ def _on_done(success, message, passes, needs_merge, sim,
 
     # Delete temporary Palace output directory
     if tmp_dir and os.path.isdir(tmp_dir):
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        rmtree_or_warn(tmp_dir)
 
     if console is not None:
         console.set_status(f"Done ({sim_elapsed})" if sim_elapsed else "Done")
@@ -1034,27 +1046,31 @@ class CmdRun:
         try:
             # Step 1 — mesh (synchronous)
             _log("Palace: Generating mesh…\n")
-            from palace.meshing import generate_mesh
+            from palace.mesh_dispatch import generate_mesh
             from palace.embedded_files import new_scratch_dir
             mesh_dir = new_scratch_dir(doc, "mesh_run")
-            t0_mesh = time.time()
-            mesh_path, geometry_path, quality = generate_mesh(doc, mesh_dir, log_fn=_mesh_log)
-            mesh_elapsed = _fmt_elapsed(time.time() - t0_mesh)
-            sim.MeshFile = mesh_path
             try:
-                mesh_obj = _update_mesh_object(doc, mesh_path, geometry_path=geometry_path)
-                # Re-point at the embedded (permanent) copy before deleting mesh_dir --
-                # generate_config() (called next, via _build_passes) reads sim.MeshFile
-                # to populate the Palace JSON config, so it must not still reference
-                # the scratch path that's about to be removed.
-                sim.MeshFile = mesh_obj.MeshFile
+                t0_mesh = time.time()
+                mesh_path, geometry_path, quality = generate_mesh(doc, mesh_dir, log_fn=_mesh_log)
+                mesh_elapsed = _fmt_elapsed(time.time() - t0_mesh)
+                sim.MeshFile = mesh_path
+                try:
+                    mesh_obj = _update_mesh_object(doc, mesh_path, geometry_path=geometry_path)
+                    # Re-point at the embedded (permanent) copy before deleting mesh_dir --
+                    # generate_config() (called next, via _build_passes) reads sim.MeshFile
+                    # to populate the Palace JSON config, so it must not still reference
+                    # the scratch path that's about to be removed.
+                    sim.MeshFile = mesh_obj.MeshFile
+                except Exception as exc:
+                    FreeCAD.Console.PrintWarning(f"Palace: mesh display update failed: {exc}\n")
+            finally:
                 # embed() copies rather than consumes a source living in a
                 # subdirectory of the transient dir (only a source file placed
                 # directly at the transient dir's root gets moved/removed) --
-                # mesh_dir must be cleaned up explicitly or it leaks on every run.
+                # mesh_dir must be cleaned up explicitly, in a finally so it
+                # isn't skipped if generate_mesh() itself raises, or it leaks
+                # on every run.
                 shutil.rmtree(mesh_dir, ignore_errors=True)
-            except Exception as exc:
-                FreeCAD.Console.PrintWarning(f"Palace: mesh display update failed: {exc}\n")
             _log(f"Palace: Mesh written to {mesh_path}\n")
             _log(f"Palace: Mesh generated in {mesh_elapsed}\n")
 

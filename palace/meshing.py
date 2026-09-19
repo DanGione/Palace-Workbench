@@ -236,11 +236,38 @@ def _assign_material_physical_groups(gmsh, log_fn,
       - Physical volume 1          → airbox background (vacuum)
       - Physical volume dg.Mesh... → each dielectric domain
 
-    Conductor solid bodies are NOT included here.  Their surfaces are imported
-    as standalone 2D BRep surfaces later (see _import_conductor_solid_faces) and
-    embedded via the combined port+conductor occ.fragment() pass.  This ensures
-    no conductor volume ever enters the mesh, avoiding the MFEM STable3D crash
-    that occurs when boundary triangles have no adjacent element.
+    Conductor solid bodies are NOT included here.  They are imported as their
+    own standalone volumes later (see _import_conductor_solids) and included
+    as objects — alongside these material volumes — in the combined
+    port+conductor occ.fragment() pass, so OCC correctly carves each
+    conductor's cavity out of the surrounding material.  That conductor
+    volume is then removed right before mesh generation (Palace treats it as
+    a PEC surface boundary condition, not a domain) — see generate_mesh().
+
+    Two dielectric solids from *different* groups can legitimately overlap in
+    the CAD model (e.g. a broad fill/substrate body that a smaller, more
+    specific dielectric is embedded in without a pre-cut cavity) -- fragment()
+    then attributes the shared sub-volume to both groups' output. A single
+    mesh volume can't have two permittivities, so contested volume tags are
+    resolved by solid size: the smaller (more specific) solid's group keeps
+    the tag, mirroring the airbox-vs-all-dielectrics subtraction below one
+    level up (the largest volume in the model is always deprioritized).
+
+    Resolving the overlap this way can leave one dielectric group split into
+    several adjacent same-material fragments (whatever's left over after the
+    contested tags are handed to other groups). The boundary *between* two
+    same-attribute fragments is physically meaningless -- both sides are the
+    same material -- but it's still a real Gmsh surface, and it can land
+    exactly tangent to a later-imported conductor or port face (a plane
+    tangent to a cylinder of matching radius, for instance), which crashes
+    mesh.generate(3) with "Invalid boundary mesh (overlapping facets)" far
+    downstream of here with no obvious connection back to the overlap
+    resolution above. Fusing same-attribute adjacent fragments back into one
+    volume before returning removes that spurious boundary outright instead
+    of hoping nothing later touches it. Fragments that don't actually touch
+    (e.g. several disjoint SMD component instances sharing one dielectric
+    group) are unaffected: occ.fuse() of disjoint solids just returns them
+    unchanged.
     """
     airbox_vtag = _match_vol_by_com(gmsh, airbox_solid, all_vol_tags_before_frag)
     if airbox_vtag is None:
@@ -254,9 +281,9 @@ def _assign_material_physical_groups(gmsh, log_fn,
         if tag is None:
             log_fn(f"Palace: WARNING — could not match dielectric solid '{solid.Label}' "
                    "in Gmsh; it will be skipped.\n")
-            diel_input_indices.append((grp, None))
+            diel_input_indices.append((grp, solid, None))
             continue
-        diel_input_indices.append((grp, len(input_dim_tags)))
+        diel_input_indices.append((grp, solid, len(input_dim_tags)))
         input_dim_tags.append((3, tag))
 
     log_fn(f"Palace: Fragmenting {len(input_dim_tags)} volume(s) for material regions…\n")
@@ -266,24 +293,67 @@ def _assign_material_physical_groups(gmsh, log_fn,
     # occ.fragment() puts ALL output volumes in outDimTagsMap[0] for the airbox
     # (every carved sub-volume geometrically coincides with the original solid).
     # Subtract dielectric volumes so only true background ends up in PG 1.
-    diel_attr_volumes = {}
-    for grp, idx in diel_input_indices:
+    per_solid = []
+    for grp, solid, idx in diel_input_indices:
         if idx is None:
             continue
         vol_tags = [t for d, t in out_map[idx] if d == 3]
+        per_solid.append((grp, vol_tags, solid.Shape.Volume))
+
+    # Resolve cross-group overlap deterministically: smaller solids (more
+    # specific bodies) claim contested volume tags before larger ones.
+    per_solid.sort(key=lambda entry: entry[2])
+    claimed_by = {}   # gmsh vol tag -> owning group's Label
+    diel_attr_volumes = {}
+    for grp, vol_tags, _ in per_solid:
         attr = grp.MeshAttribute
+        kept = []
+        for t in vol_tags:
+            owner = claimed_by.get(t)
+            if owner is not None and owner != grp.Label:
+                log_fn(f"Palace: WARNING — dielectric '{grp.Label}' overlaps "
+                       f"'{owner}' at volume tag {t}; keeping it in '{owner}' "
+                       "(smaller solids take precedence) — check for an "
+                       "unintended overlap in the CAD model.\n")
+                continue
+            claimed_by[t] = grp.Label
+            kept.append(t)
         if attr not in diel_attr_volumes:
             diel_attr_volumes[attr] = (grp, [])
-        diel_attr_volumes[attr][1].extend(vol_tags)
+        diel_attr_volumes[attr][1].extend(kept)
 
+    # Fuse same-attribute adjacent fragments into one volume so no spurious
+    # same-material internal boundary survives to confuse mesh.generate(3)
+    # later (see docstring). No-op for groups whose fragments don't touch.
+    for attr, (grp, vol_tags) in list(diel_attr_volumes.items()):
+        if len(vol_tags) > 1:
+            fused_out, _ = gmsh.model.occ.fuse(
+                [(3, vol_tags[0])], [(3, t) for t in vol_tags[1:]])
+            gmsh.model.occ.synchronize()
+            new_tags = [t for d, t in fused_out if d == 3]
+            log_fn(f"Palace: Fused {len(vol_tags)} same-material fragment(s) of "
+                   f"'{grp.Label}' into {len(new_tags)} volume(s) {new_tags}\n")
+            diel_attr_volumes[attr] = (grp, new_tags)
+
+    # Cheap defensive cleanup after the batch of fuses above; a no-op when
+    # there's nothing left to merge.
+    gmsh.model.occ.removeAllDuplicates()
+    gmsh.model.occ.synchronize()
+
+    # Compute background from a fresh entity query rather than the stale
+    # pre-fuse out_map[0] -- fuse() can renumber tags.
     non_bg_vol_tags = set()
     for _, vol_tags in diel_attr_volumes.values():
         non_bg_vol_tags.update(vol_tags)
+    all_vol_tags_now = {t for _, t in gmsh.model.getEntities(3)}
+    bg_vol_tags = sorted(all_vol_tags_now - non_bg_vol_tags)
 
-    bg_vol_tags = [t for d, t in out_map[0] if d == 3 and t not in non_bg_vol_tags]
     gmsh.model.addPhysicalGroup(3, bg_vol_tags, 1)
     gmsh.model.setPhysicalName(3, 1, "Airbox_Background")
     log_fn(f"Palace: Airbox background → volume tags {bg_vol_tags} (attr 1)\n")
+    if not bg_vol_tags:
+        log_fn("Palace: WARNING — Airbox_Background has zero volumes (no vacuum "
+               "region); confirm a fully-potted/no-air-gap design is intended.\n")
 
     for attr, (grp, vol_tags) in diel_attr_volumes.items():
         gmsh.model.addPhysicalGroup(3, vol_tags, attr)
@@ -480,21 +550,29 @@ def _fuse_group_solids(grp, solids, log_fn):
     return _validate_shape(shape, label, log_fn), label
 
 
-def _import_conductor_solid_faces(gmsh, cond_bodies, log_fn, skip_normals=None):
+def _import_conductor_solids(gmsh, cond_bodies, log_fn):
     """
     For each conductor group, fuse all its child solids into one shape (see
-    _fuse_group_solids) and export every face as a BRep 2-D surface, importing
-    it into Gmsh as a standalone OCC surface.
+    _fuse_group_solids) and import the WHOLE shape into Gmsh as one or more
+    standalone OCC volumes — never decomposed into individual faces.
 
-    Returns list of (cg_obj, [gmsh_surf_tags]) — one entry per conductor
-    group.  Surfaces are imported but NOT yet fragmented; call
-    occ.fragment() afterwards.
+    Returns list of (cg_obj, [gmsh_vol_tags]) — one entry per conductor
+    group.  A group whose fused shape is a Compound of disjoint solids (e.g.
+    many separate SMD contacts) yields one volume tag per disjoint solid.
 
-    skip_normals : list of FreeCAD.Vector, optional
-        Conductor faces whose outward normal is parallel to any of these
-        (|dot product| > 0.99) are skipped.  Pass port face normals to
-        exclude conductor end faces that share a plane with a port face,
-        which would otherwise create triple-edges causing an MFEM crash.
+    Volumes are imported but NOT yet fragmented. The caller must include
+    them as *objects* (not tools) in the combined port+conductor
+    occ.fragment() pass, so OCC's boolean kernel actually carves the
+    conductor's cavity out of whatever surrounding material volume(s) it
+    overlaps — see generate_mesh(). Importing only bare 2-D faces and
+    relying on fragment() to *infer* an enclosed cavity from that loose,
+    disconnected set was tried first and found unreliable: real documents
+    reliably produced boundary triangles with no adjacent tetrahedron (an
+    MFEM STable3D abort) on roughly half of every conductor's own faces,
+    confirmed by checking Gmsh topology adjacency directly (some faces
+    ended up bounding zero volumes; others were absorbed into a coincident
+    dielectric/dielectric interface instead of becoming the conductor's own
+    boundary). See CLAUDE.md for the investigation.
     """
     by_group = {}
     order = []
@@ -507,39 +585,27 @@ def _import_conductor_solid_faces(gmsh, cond_bodies, log_fn, skip_normals=None):
     result = []
     for grp in order:
         shape, label = _fuse_group_solids(grp, by_group[grp], log_fn)
-        surf_tags_for_grp = []
-        for face_idx, face in enumerate(shape.Faces):
-            if skip_normals:
-                try:
-                    fn = face.normalAt(0, 0)
-                    fn.normalize()
-                    if any(abs(fn.dot(pn)) > 0.99 for pn in skip_normals):
-                        log_fn(f"Palace: Skipping conductor face {face_idx} of "
-                               f"'{label}' (end face parallel to a port)\n")
-                        continue
-                except Exception:
-                    pass
-            brep_path = tempfile.mktemp(suffix=".brep")
+        brep_path = tempfile.mktemp(suffix=".brep")
+        new_tags = []
+        try:
+            shape.exportBrep(brep_path)
+            vol_before = {t for _, t in gmsh.model.getEntities(3)}
+            gmsh.model.occ.importShapes(brep_path)
+            gmsh.model.occ.synchronize()
+            new_tags = [t for _, t in gmsh.model.getEntities(3)
+                        if t not in vol_before]
+        except Exception as exc:
+            log_fn(f"Palace: WARNING — could not import conductor "
+                   f"'{label}': {exc}\n")
+        finally:
             try:
-                face.exportBrep(brep_path)
-                surf_before = {t for _, t in gmsh.model.getEntities(2)}
-                gmsh.model.occ.importShapes(brep_path)
-                gmsh.model.occ.synchronize()
-                new_tags = [t for _, t in gmsh.model.getEntities(2)
-                            if t not in surf_before]
-                surf_tags_for_grp.extend(new_tags)
-            except Exception as exc:
-                log_fn(f"Palace: WARNING — could not import face {face_idx} of "
-                       f"conductor '{label}': {exc}\n")
-            finally:
-                try:
-                    os.unlink(brep_path)
-                except OSError:
-                    pass
-        if surf_tags_for_grp:
+                os.unlink(brep_path)
+            except OSError:
+                pass
+        if new_tags:
             log_fn(f"Palace: Conductor '{label}' → "
-                   f"{len(surf_tags_for_grp)} face surface(s) imported\n")
-        result.append((grp, surf_tags_for_grp))
+                   f"{len(new_tags)} volume(s) imported\n")
+        result.append((grp, new_tags))
     return result
 
 
@@ -589,22 +655,40 @@ def _update_vol_physical_groups_after_fragment(gmsh, old_vol_tags, out_map,
                  f"→ new {new_vtags}\n")
             pg_to_new_vols.setdefault(pg_tag, []).extend(new_vtags)
 
-    # Remove any surviving volume PGs (some may have already been auto-removed
-    # by synchronize(); removePhysicalGroups is a no-op for non-existent ones).
-    existing_pgs = {pg_tag for _, pg_tag in gmsh.model.getPhysicalGroups(3)}
-    gmsh.model.removePhysicalGroups(
-        [(3, pg_tag) for pg_tag in vol_pg_info if pg_tag in existing_pgs])
+    _log(f"Palace: [vol-PG rebuild] Gmsh physical volumes before rebuild: "
+         f"{gmsh.model.getPhysicalGroups(3)}\n")
 
+    # Remove and immediately re-add each group individually — Gmsh's OCC
+    # physical-group bookkeeping after occ.fragment()+synchronize() can, in
+    # rare cases, still report a group as present (addPhysicalGroup raising
+    # "Physical volume N already exists") even right after removing it. Retry
+    # once with a forced individual removal, and skip (warn, don't abort the
+    # whole mesh) if that still fails — removePhysicalGroups() is a no-op for
+    # already-nonexistent groups, so calling it unconditionally is safe.
     for pg_tag, (name, _) in vol_pg_info.items():
         new_vols = pg_to_new_vols.get(pg_tag, [])
         _log(f"Palace: [vol-PG rebuild] Rebuilding PG {pg_tag} '{name}' "
              f"with vols {new_vols}\n")
-        if new_vols:
-            gmsh.model.addPhysicalGroup(3, new_vols, pg_tag)
-            gmsh.model.setPhysicalName(3, pg_tag, name)
-        else:
+        if not new_vols:
             _log(f"Palace: WARNING — vol PG {pg_tag} '{name}' lost all "
                  "entities after port fragment; check geometry.\n")
+            continue
+
+        gmsh.model.removePhysicalGroups([(3, pg_tag)])
+        try:
+            gmsh.model.addPhysicalGroup(3, new_vols, pg_tag)
+        except Exception:
+            _log(f"Palace: WARNING — PG {pg_tag} '{name}' still reported as "
+                 "existing after removal; retrying once…\n")
+            gmsh.model.removePhysicalGroups([(3, pg_tag)])
+            try:
+                gmsh.model.addPhysicalGroup(3, new_vols, pg_tag)
+            except Exception as exc:
+                _log(f"Palace: WARNING — could not rebuild vol PG {pg_tag} "
+                     f"'{name}' ({exc}); skipping — its volumes will be "
+                     "missing from the mesh's material assignment.\n")
+                continue
+        gmsh.model.setPhysicalName(3, pg_tag, name)
 
 
 # ---------------------------------------------------------------------------
@@ -903,10 +987,10 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
 
     # Collect all solid bodies to export (airbox first, then dielectric solids,
     # then any extra port-parent solids not already included).
-    # Conductor solids are deliberately excluded — their faces are imported later
-    # as standalone BRep 2-D surfaces so no conductor volume enters the mesh
-    # (avoiding the MFEM STable3D crash from boundary triangles with no adjacent
-    # volume element).
+    # Conductor solids are deliberately excluded from this STEP export — they
+    # are imported separately, as their own standalone volumes, later (see
+    # _import_conductor_solids) so they can be included as objects in the
+    # combined port+conductor occ.fragment() pass.
     export_objs = [_airbox_solid]
     for _, solid in diel_bodies:
         if solid not in export_objs:
@@ -961,8 +1045,8 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
 
         # --- Material group fragmentation (dielectrics only) -------------------
         # Must run before port surface matching because fragment() renumbers
-        # Gmsh entities.  Conductor solid bodies are NOT included here — their
-        # faces are imported as BRep 2-D surfaces after the port import loop and
+        # Gmsh entities.  Conductor solid bodies are NOT included here — they
+        # are imported as their own volumes after the port import loop and
         # embedded into the mesh via the combined port+conductor fragment pass.
         if has_dielectrics:
             all_vol_tags_pre = [t for _, t in all_volumes]
@@ -1102,51 +1186,52 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
                     f"for wave port {port.PortIndex}: {exc}\n"
                 )
 
-        # Collect normals of port faces so conductor end faces at the same
-        # cross-section can be skipped — they create triple-edges with port
-        # surface elements that MFEM rejects in AddSegmentFaceElement.
-        # This applies to both planar lumped ports AND wave ports: the
-        # conductor end-face (2-D, attr 100), the wave port face (2-D, attr 11),
-        # and a PortBoundaryCurve (1-D, attr 2) would all share the same outer
-        # edge, which triggers the MFEM AddSegmentFaceElement assertion.
+        # Collect port face planes (normal + offset) so conductor end faces
+        # coincident with a port's own plane can be excluded from the PEC
+        # group after the fragment — they'd otherwise create triple-edges
+        # with port surface elements that MFEM rejects in
+        # AddSegmentFaceElement. This applies to both planar lumped ports AND
+        # wave ports: the conductor end-face (2-D, attr 100), the wave port
+        # face (2-D, attr 11), and a PortBoundaryCurve (1-D, attr 2) would all
+        # share the same outer edge, which triggers the MFEM
+        # AddSegmentFaceElement assertion.
         # The wave port 2D eigenvalue correctly sees PEC at conductor boundaries
         # because config.py emits WavePortPEC for Lossy Conductor groups, which
         # is applied by Palace regardless of whether the ±Y end-faces are present.
-        port_face_normals = []
+        def _face_plane(fc_face):
+            n = fc_face.normalAt(0, 0)
+            n.normalize()
+            com = fc_face.CenterOfMass
+            return (n.x, n.y, n.z, n.x * com.x + n.y * com.y + n.z * com.z)
+
+        cond_skip_planes = []
         for port in lumped_ports:
             if getattr(port, "PortGeometryType", "") == "planar":
                 if hasattr(port, "Shape") and port.Shape.Faces:
                     try:
-                        n = port.Shape.Faces[0].normalAt(0, 0)
-                        n.normalize()
-                        port_face_normals.append(n)
+                        cond_skip_planes.append(_face_plane(port.Shape.Faces[0]))
                     except Exception:
                         pass
         for port in wave_ports:
             for link_obj, subnames in (port.PortFaces or []):
                 for subname in subnames:
                     try:
-                        fc_face = link_obj.Shape.getElement(subname)
-                        n = fc_face.normalAt(0, 0)
-                        n.normalize()
-                        port_face_normals.append(n)
+                        cond_skip_planes.append(
+                            _face_plane(link_obj.Shape.getElement(subname)))
                     except Exception:
                         pass
 
-        # Import conductor solid faces as standalone BRep 2-D surfaces.
-        # Done after the planar port import so that both sets of surfaces enter
-        # the combined fragment together.  No conductor volume is ever added to
-        # the Gmsh model, eliminating the MFEM STable3D crash.
-        cond_brep_surf_list = (
-            _import_conductor_solid_faces(
-                gmsh, cond_bodies, log_fn,
-                skip_normals=port_face_normals if port_face_normals else None,
-            )
+        # Import each conductor group's fused solid as its own standalone
+        # Gmsh volume (not decomposed into faces) — see _import_conductor_solids
+        # for why. Done after the planar port import so both sets of entities
+        # enter the combined fragment together.
+        cond_vol_list = (
+            _import_conductor_solids(gmsh, cond_bodies, log_fn)
             if cond_bodies else []
         )
 
-        # Fragment all volumes with planar port surfaces AND conductor surfaces
-        # in one call.
+        # Fragment all volumes (materials AND conductors) with planar port
+        # surfaces in one call.
         #
         # IMPORTANT: the fragment may also split existing tracked surfaces (e.g.
         # the top face of a conductor ground-plane solid is cut by the port face
@@ -1157,11 +1242,18 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
         cond_final_data = []   # (grp, [post-fragment gmsh_surf_tags]) — for refinement fields
 
         if (planar_port_surf_list or wave_port_surf_list
-                or cond_brep_surf_list or wave_port_edge_list):
+                or cond_vol_list or wave_port_edge_list):
+            # Conductor volumes were already imported into the SAME Gmsh model
+            # above, so getEntities(3) here picks them up alongside the
+            # material volumes — appended at the end (higher tags, imported
+            # later). Including them as objects (not tools) is what lets OCC
+            # actually carve each conductor's cavity out of the surrounding
+            # material via this fragment, instead of just embedding inert
+            # faces and hoping fragment infers the hole.
             all_vol_tags_now    = [t for _, t in gmsh.model.getEntities(3)]
             all_planar_tags     = [t for _, tags in planar_port_surf_list for t in tags]
             all_wave_port_tags  = [t for _, tags in wave_port_surf_list for t in tags]
-            all_cond_brep_tags  = [t for _, tags in cond_brep_surf_list for t in tags]
+            all_cond_vol_tags   = [t for _, tags in cond_vol_list for t in tags]
             all_integ_curve_tags = [t for _, tags in wave_port_edge_list for t in tags]
 
             # Snapshot ALL physical-group metadata BEFORE the fragment.
@@ -1187,19 +1279,20 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
                 entities = list(gmsh.model.getEntitiesForPhysicalGroup(2, pg_tag))
                 surf_pg_info[pg_tag] = (name, entities)
 
-            # Tool list: planar lumped ports, then wave ports, then conductors,
-            # then tracked surfaces.  Integration edge curves are appended as
-            # 1-D tools after all surface tools so that the surface old→new map
-            # index arithmetic is unchanged.
-            all_tool_tags = all_planar_tags + all_wave_port_tags + all_cond_brep_tags + tracked_surf_tags
+            # Tool list: planar lumped ports, then wave ports, then tracked
+            # surfaces.  Conductors are NOT tools here — they're already part
+            # of vol_dim_tags (see above) as objects.  Integration edge curves
+            # are appended as 1-D tools after all surface tools so that the
+            # surface old→new map index arithmetic is unchanged.
+            all_tool_tags = all_planar_tags + all_wave_port_tags + tracked_surf_tags
             vol_dim_tags  = [(3, t) for t in all_vol_tags_now]
             surf_dim_tags = ([(2, t) for t in all_tool_tags]
                              + [(1, t) for t in all_integ_curve_tags])
 
-            log_fn(f"Palace: Fragmenting {len(all_vol_tags_now)} volume(s) with "
+            log_fn(f"Palace: Fragmenting {len(all_vol_tags_now)} volume(s) "
+                   f"(incl. {len(all_cond_vol_tags)} conductor volume(s)) with "
                    f"{len(all_planar_tags)} planar port surface(s), "
                    f"{len(all_wave_port_tags)} wave port surface(s), "
-                   f"{len(all_cond_brep_tags)} conductor surface(s), "
                    f"{len(all_integ_curve_tags)} integration edge(s) "
                    f"(+ {len(tracked_surf_tags)} tracked surface(s))…\n")
             _, out_map_ports = gmsh.model.occ.fragment(vol_dim_tags, surf_dim_tags)
@@ -1225,6 +1318,45 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
             _update_vol_physical_groups_after_fragment(
                 gmsh, all_vol_tags_now, out_map_ports,
                 vol_pg_info=vol_pg_info_snap, log_fn=log_fn)
+
+            # Resolve every conductor group's post-fragment volume tag(s) and
+            # build the GLOBAL set across all conductor groups, up front —
+            # needed before port assignment below, not just before the
+            # conductor PEC assignment further down. Where a wave/planar
+            # port's own selected face physically overlaps a conductor
+            # passing through it (e.g. the classic coaxial wave port wrapped
+            # around its own center conductor), the combined fragment can
+            # split off a sliver of the port face that borders the
+            # conductor's cavity instead of real background material. Ports
+            # are assigned before conductors below, so without this check
+            # up front such a sliver would be claimed by the port group,
+            # then orphaned once the conductor's (unlabeled) interior volume
+            # is removed before meshing — every port-assignment path below
+            # must exclude any candidate surface touching a conductor
+            # interior, the same way the conductor's own assignment already
+            # excludes surfaces coincident with a port plane
+            # (cond_skip_planes).
+            vol_old_to_new = {
+                old_tag: [t for d, t in out_map_ports[i] if d == 3]
+                for i, old_tag in enumerate(all_vol_tags_now)
+            }
+            cond_new_vols = []   # (grp, attr, [new_vol_tags])
+            all_cond_interior_vols = []
+            for grp, orig_vol_tags in cond_vol_list:
+                new_vol_tags = [t for old in orig_vol_tags
+                                for t in vol_old_to_new.get(old, [])]
+                if not new_vol_tags:
+                    log_fn(f"Palace: WARNING — conductor '{grp.Label}' produced "
+                           "no volume after fragment; check its geometry lies "
+                           "within the airbox.\n")
+                    continue
+                cond_new_vols.append((grp, grp.MeshAttribute, new_vol_tags))
+                all_cond_interior_vols.extend(new_vol_tags)
+            all_cond_vol_set = set(all_cond_interior_vols)
+
+            def _touches_cond_interior(tag):
+                vols = gmsh.model.getAdjacencies(2, tag)[0]
+                return any(v in all_cond_vol_set for v in vols)
 
             # Rebuild existing 2D physical groups using the new entity tags.
             still_valid = {t for _, t in gmsh.model.getEntities(2)}
@@ -1259,6 +1391,11 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
                     output = [t for d, t in out_map_ports[n_vols + flat_idx] if d == 2]
                     port_surf_final.extend(output)
                     flat_idx += 1
+                # Drop any sliver that borders a conductor's (soon-to-be-
+                # removed) interior instead of real background material —
+                # see the comment above _touches_cond_interior's definition.
+                port_surf_final = [t for t in port_surf_final
+                                   if not _touches_cond_interior(t)]
                 if port_surf_final:
                     gmsh.model.addPhysicalGroup(2, port_surf_final, port.MeshAttribute)
                     gmsh.model.setPhysicalName(2, port.MeshAttribute,
@@ -1277,14 +1414,15 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
                            "face lies within the airbox.\n")
 
             # Assign wave port physical groups from the fragmented wave port BRep surfaces.
-            # Use old_to_new_surf (same as conductors) rather than flat_idx so the
-            # accounting is independent of planar port count.
+            # Use old_to_new_surf rather than flat_idx so the accounting is
+            # independent of planar port count.
             for port, orig_tags in wave_port_surf_list:
                 port_surf_final = []
                 for old_tag in orig_tags:
                     port_surf_final.extend(old_to_new_surf.get(old_tag, []))
                 port_surf_final = [t for t in port_surf_final
-                                   if t not in used_surface_tags]
+                                   if t not in used_surface_tags
+                                   and not _touches_cond_interior(t)]
                 if port_surf_final:
                     gmsh.model.addPhysicalGroup(2, port_surf_final, port.MeshAttribute)
                     gmsh.model.setPhysicalName(2, port.MeshAttribute,
@@ -1300,21 +1438,77 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
                            "no output surfaces after fragment; check that the port "
                            "face lies on the airbox boundary.\n")
 
-            # Assign conductor PEC physical groups from conductor BRep surfaces.
+            # Assign conductor PEC physical groups from the boundary of each
+            # conductor group's (still-unlabeled) post-fragment volume(s),
+            # then remove those volumes so no conductor interior is ever
+            # meshed as a domain. getBoundary(combined=True) returns the true
+            # outer skin of a group's volume(s) as a set, merging away any
+            # internal face where the fragment happened to slice straight
+            # through the conductor along a material-domain boundary — so a
+            # conductor straddling two dielectrics still gets one clean PEC
+            # boundary, not a spurious extra internal face.
             # Ports take priority: skip surface tags already in used_surface_tags.
+            # A conductor face coincident with a port's own plane is also
+            # skipped (cond_skip_planes) — see the comment above that list.
             # Multiple conductor groups may share the same MeshAttribute, so
             # accumulate into a per-attr list then register one PG per attr.
+            # (vol_old_to_new / cond_new_vols / all_cond_vol_set were already
+            # resolved above, before port assignment.)
             cond_attr_surf_map = {}   # attr → [final surf tags]
-            for grp, orig_cond_tags in cond_brep_surf_list:
-                attr = grp.MeshAttribute
+            for grp, attr, new_vol_tags in cond_new_vols:
+                new_vol_tag_set = set(new_vol_tags)
+                boundary = gmsh.model.getBoundary(
+                    [(3, t) for t in new_vol_tags], combined=True, oriented=False)
                 grp_final_tags = []
-                for old_tag in orig_cond_tags:
-                    new_tags_for_face = old_to_new_surf.get(old_tag, [old_tag])
-                    unclaimed = [t for t in new_tags_for_face
-                                 if t not in used_surface_tags]
-                    cond_attr_surf_map.setdefault(attr, []).extend(unclaimed)
-                    grp_final_tags.extend(unclaimed)
-                    used_surface_tags.update(unclaimed)
+                n_rejected = 0
+                for d, t in boundary:
+                    if d != 2:
+                        continue
+                    tag = abs(t)
+                    if tag in used_surface_tags:
+                        continue
+                    # A genuine conductor boundary face bounds exactly two
+                    # volumes right now (before every conductor's interior is
+                    # removed below): this conductor's own interior on one
+                    # side, real surrounding material (not another
+                    # conductor's interior, whether the same group or a
+                    # different one) on the other. Where the combined
+                    # fragment leaves a conductor split into several
+                    # same-attribute pieces (e.g. passing through a heavily
+                    # fragmented dielectric region) or two different
+                    # conductor groups physically touch, getBoundary(combined=
+                    # True) can't fully cancel the internal face between
+                    # them -- that face is topologically still attached to a
+                    # conductor but never gained a real exterior neighbor,
+                    # which would otherwise leave a boundary triangle with no
+                    # adjacent tetrahedron (the MFEM STable3D abort this
+                    # whole fix targets). Reject those here rather than
+                    # assigning them: dropping a handful of surfaces from the
+                    # PEC group at an already electrically-continuous
+                    # conductor/conductor junction is far cheaper than a hard
+                    # Palace abort.
+                    vols = gmsh.model.getAdjacencies(2, tag)[0]
+                    n_self = sum(1 for v in vols if v in new_vol_tag_set)
+                    n_other_cond = sum(1 for v in vols
+                                        if v not in new_vol_tag_set
+                                        and v in all_cond_vol_set)
+                    if len(vols) != 2 or n_self != 1 or n_other_cond != 0:
+                        n_rejected += 1
+                        continue
+                    cx, cy, cz = _gmsh_bbox_centre(gmsh, 2, tag)
+                    if any(abs(nx * cx + ny * cy + nz * cz - pd) < 0.01
+                           for nx, ny, nz, pd in cond_skip_planes):
+                        continue
+                    grp_final_tags.append(tag)
+                    used_surface_tags.add(tag)
+                if n_rejected:
+                    log_fn(f"Palace: WARNING — conductor '{grp.Label}' "
+                           f"(attr {attr}): {n_rejected} boundary surface(s) "
+                           "did not cleanly bound the surrounding material "
+                           "after fragment and were excluded from the PEC "
+                           "group (left un-tagged rather than risking an "
+                           "orphaned boundary element).\n")
+                cond_attr_surf_map.setdefault(attr, []).extend(grp_final_tags)
                 cond_final_data.append((grp, grp_final_tags))
 
             for attr, surf_tags in cond_attr_surf_map.items():
@@ -1323,6 +1517,18 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
                     gmsh.model.setPhysicalName(2, attr, f"Conductor_{attr}")
                     log_fn(f"Palace: Conductor (attr {attr}) → "
                            f"surf tags {surf_tags}\n")
+
+            # The conductor's own interior is never meshed as a domain —
+            # Palace treats it as a PEC boundary condition on the surface
+            # just assigned above, not a 3-D region. Removed here (not
+            # earlier) so its boundary faces stay alive through the physical
+            # group assignment above; recursive=False removes only the 3-D
+            # entity itself.
+            if all_cond_interior_vols:
+                gmsh.model.occ.remove(
+                    [(3, t) for t in all_cond_interior_vols], recursive=False)
+                gmsh.model.occ.synchronize()
+                _flush_gmsh()
 
             # Refresh after planar port+conductor fragment
             all_surfaces = gmsh.model.getEntities(2)
@@ -1531,7 +1737,7 @@ def generate_mesh(doc, output_dir, log_fn=None, _gmsh_instance=None):
                     n = max(8, math.ceil(edge_len / max(seg_size, 0.01)))
                     gmsh.model.mesh.setTransfiniteCurve(ctag, n + 1)
 
-        # Collect dielectric boundary surfaces per group (mirrors cond_brep_surf_list).
+        # Collect dielectric boundary surfaces per group (mirrors cond_final_data).
         # Surfaces bounding a non-background volume, excluding already-assigned port/BC surfaces.
         diel_data = []
         if has_dielectrics:

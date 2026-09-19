@@ -26,7 +26,7 @@ Part workbench primitives (Part Box, Part Cylinder) also work, but they're harde
 
 ### Keep bodies non-overlapping
 
-Palace uses the mesh to define material interfaces. If two solids overlap (e.g., a trace body that penetrates the substrate), Gmsh may produce degenerate elements or incorrect interfaces. Either model solids that share faces exactly, or use Boolean operations (Part → Boolean → Cut) to remove the overlap.
+Palace uses the mesh to define material interfaces. If two solids overlap (e.g., a trace body that penetrates the substrate), the mesher may produce degenerate elements or incorrect interfaces regardless of backend. Either model solids that share faces exactly, or use Boolean operations (Part → Boolean → Cut) to remove the overlap.
 
 ### Airbox size
 
@@ -58,6 +58,16 @@ A **Dielectric** group assigns permittivity and loss tangent to a solid.
 - **Loss tangent:** tan δ (0 = lossless). Typical PCB substrates: Rogers 4003C tan δ ≈ 0.0027.
 - **Bodies:** same assignment workflow as conductor groups.
 
+### Tree organization vs. material groups
+
+Conductor/Dielectric groups are something you create deliberately and assign
+material properties to — they affect the simulation physics. Ports,
+Impedance Boundaries, and Components get their *own*, separate kind of
+grouping purely for tree tidiness (a **Ports** group, an **Impedance
+Boundaries** group, a **Components** group) — these appear and disappear
+automatically as you add or remove objects and have no properties of their
+own to configure. See [Ports Reference → Tree organization](ports-reference.md#tree-organization).
+
 ---
 
 ## VarSets and parametric geometry
@@ -82,11 +92,11 @@ VarSets are the entry point for the **Sweep & Optimization** feature. Palace can
 
 ## Common pitfalls
 
-**Gap between conductor and dielectric:** If there is even a tiny gap between a trace and the substrate it sits on, Gmsh inserts vacuum elements in between. The result is wrong S-parameters and unrealistic fields. Ensure faces are co-planar or use Boolean fusion.
+**Gap between conductor and dielectric:** If there is even a tiny gap between a trace and the substrate it sits on, the mesher inserts vacuum elements in between. The result is wrong S-parameters and unrealistic fields. Ensure faces are co-planar or use Boolean fusion. This applies regardless of which [mesh backend](simulation-reference.md#choosing-a-mesh-backend) you use.
 
-**Degenerate/sliver mesh elements from mixed-scale features in one group:** A Conductor or Dielectric group that mixes a very thin feature (a 25–50 µm trace or ground-plane layer) with a much larger body in the *same* group (a connector shell or via barrel several mm across) forces one **Conductor size** setting to serve both scales — too coarse and Gmsh can't resolve the thin layer at all, producing near-zero-quality (occasionally inverted) tetrahedra right at the seam between the two; fine enough for the thin layer and the whole group, including the large body, gets meshed at that resolution, which can be far more expensive than necessary. This is a mesh-*sizing* problem, not primarily a geometry one — fusing the solids or giving them a deliberate interference fit doesn't fix it on its own, since the elements degrade from an inappropriate target size, not from how the surfaces touch. Palace checks for this automatically after meshing (see [Simulation Reference → Mesh quality check](simulation-reference.md#mesh-quality-check)) and warns if it finds it; the fix is to set **Conductor size** to roughly the thinnest feature's own thickness and a **Refine distance** that keeps the fine region local, per group.
+**Degenerate/sliver mesh elements from mixed-scale features in one group (Gmsh backend only):** A Conductor or Dielectric group that mixes a very thin feature (a 25–50 µm trace or ground-plane layer) with a much larger body in the *same* group (a connector shell or via barrel several mm across) forces one **Conductor size** setting to serve both scales — too coarse and Gmsh can't resolve the thin layer at all, producing near-zero-quality (occasionally inverted) tetrahedra right at the seam between the two; fine enough for the thin layer and the whole group, including the large body, gets meshed at that resolution, which can be far more expensive than necessary. This is a mesh-*sizing* problem, not primarily a geometry one — fusing the solids or giving them a deliberate interference fit doesn't fix it on its own, since the elements degrade from an inappropriate target size, not from how the surfaces touch. The workbench checks for this automatically after meshing (see [Simulation Reference → Mesh quality check](simulation-reference.md#mesh-quality-check)) and warns if it finds it; the fix is to set **Conductor size** to roughly the thinnest feature's own thickness and a **Refine distance** that keeps the fine region local, per group. This entire class of problem is specific to Gmsh's manual sizing model — the [Netgen backend](simulation-reference.md#choosing-a-mesh-backend) sizes automatically per-feature and doesn't need a single Conductor size to serve a whole group, so switching to it is also a valid fix if manual tuning isn't converging.
 
-**Same warning, different cause — Refine distance too tight on a single feature:** don't assume every low-quality-mesh warning is a mixed-scale group. A group with one well-scaled feature (Conductor size already a good match for its geometry) can still produce inverted elements if its **Refine distance** compresses too large a size jump into too short a span — e.g. a 0.1 mm feature against a 3 mm background with only 0.2 mm of Refine distance to bridge them. The fix here is the opposite instinct from the mixed-scale case: *lengthen* Refine distance (or clear it to blank/auto) rather than touching Conductor size. See [Troubleshooting → Palace warns about low mesh quality](troubleshooting.md#mesh-generation) for the worked numbers.
+**Same warning, different cause — Refine distance too tight on a single feature (Gmsh backend only):** don't assume every low-quality-mesh warning is a mixed-scale group. A group with one well-scaled feature (Conductor size already a good match for its geometry) can still produce inverted elements if its **Refine distance** compresses too large a size jump into too short a span — e.g. a 0.1 mm feature against a 3 mm background with only 0.2 mm of Refine distance to bridge them. The fix here is the opposite instinct from the mixed-scale case: *lengthen* Refine distance (or clear it to blank/auto) rather than touching Conductor size. See [Troubleshooting → Palace warns about low mesh quality](troubleshooting.md#mesh-generation) for the worked numbers. Again, this doesn't apply to the Netgen backend at all — there's no Refine distance setting to get wrong.
 
 **Airbox too tight:** If the Airbox faces cut through a material region, Palace will reject the mesh or produce incorrect BCs on those faces. Always verify there is clearance on every side.
 

@@ -28,9 +28,11 @@ Rules enforced by FreeCAD itself (see PropertyFileIncluded C++ docs):
     ``CmdMesh.Activated`` for the required cleanup pattern.
 """
 
+import glob
 import os
 import shutil
 import stat
+import tempfile
 
 
 def new_scratch_file(doc, prefix):
@@ -58,6 +60,44 @@ def new_scratch_dir(doc, prefix):
     path = doc.getTempFileName(prefix)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def reap_orphaned_scratch_dirs(base_dir=None):
+    """Remove palace_* scratch dirs left behind by a killed prior session.
+
+    commands/cmd_run.py and commands/cmd_sweep.py build Palace's actual solver
+    working directory with tempfile.mkdtemp(prefix="palace_"/"palace_sweep_"/
+    "palace_opt_") -- outside FreeCAD's own transient-dir machinery, so nothing
+    else ever reclaims it if the process is killed mid-run. Safe to call
+    unconditionally: once this process has started, no in-memory coordinator
+    can still own a palace_* dir that already existed on disk beforehand, so
+    anything matching here is guaranteed orphaned.
+    """
+    removed = []
+    for path in glob.glob(os.path.join(base_dir or tempfile.gettempdir(), "palace_*")):
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(path)
+    if removed:
+        import FreeCAD
+        FreeCAD.Console.PrintMessage(
+            f"Palace: reaped {len(removed)} orphaned scratch dir(s) from a previous session.\n"
+        )
+    return removed
+
+
+def rmtree_or_warn(path):
+    """shutil.rmtree(path), logging (not swallowing) any failure.
+
+    Use for the authoritative cleanup of Palace's real solver-output directory
+    (tmp_dir in cmd_run.py) so a partial-deletion failure is visible in the
+    Report View instead of silently leaving scratch data on disk.
+    """
+    try:
+        shutil.rmtree(path)
+    except Exception as exc:
+        import FreeCAD
+        FreeCAD.Console.PrintWarning(f"Palace: failed to remove scratch dir {path}: {exc}\n")
 
 
 def copy_for_rewrite(source_path, dest_path):

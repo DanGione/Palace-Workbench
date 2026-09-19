@@ -28,7 +28,7 @@ from features.component import (
 )
 from features.material_group import get_or_create_dielectric_group, get_or_create_conductor_group
 from features.impedance_boundary import create_impedance_boundary
-from features import next_port_index
+from features import next_impedance_index
 
 CERAMIC_MATERIAL = "SmdCeramic"
 COATING_MATERIAL = "SmdCoating"
@@ -200,7 +200,7 @@ def create_smd_component(doc, component_type, size_code, value_si,
     name_left, _ = find_edge_by_midpoint(c["left_lower"], c["gap_left"])
     name_right, _ = find_edge_by_midpoint(c["right_lower"], c["gap_right"])
 
-    idx = port_index if port_index is not None else next_port_index(doc)
+    idx = port_index if port_index is not None else next_impedance_index(doc)
     boundary = create_impedance_boundary(
         doc, index=idx,
         edge_refs=[(shadow_contacts[0], name_left), (shadow_contacts[2], name_right)],

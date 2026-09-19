@@ -60,8 +60,11 @@ ENV PATH=${CONDA_DIR}/bin:${PATH}
 RUN conda install -y -c conda-forge --override-channels "freecad=1.0.0" \
     && conda clean -afy
 
-# ── gmsh (Python API + CLI) ──────────────────────────────────────────────────
-RUN pip install --no-cache-dir gmsh numpy scipy cmake matplotlib xarray netCDF4
+# ── gmsh (Python API + CLI) + netgen (Python API) ───────────────────────────
+# netgen-mesher: verified to import cleanly (netgen.occ) alongside gmsh in the
+# same FreeCAD interpreter, both import orders, no OCC symbol conflict despite
+# each vendoring its own OpenCASCADE build -- no separate venv needed.
+RUN pip install --no-cache-dir gmsh netgen-mesher numpy scipy cmake matplotlib xarray netCDF4
 
 # ── Palace (AWSLabs) — pinned release from GitHub ─────────────────────────────
 # Palace ships a CMake superbuild that downloads and compiles all of its own
