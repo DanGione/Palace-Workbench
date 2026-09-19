@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Group background -->
+  <rect x="4" y="10" width="56" height="44" rx="5" fill="#FFF3E0" stroke="#E65100" stroke-width="2.5"/>
+  <!-- Resistor zigzag -->
+  <path d="M 8,32 L 16,32 L 20,22 L 26,42 L 32,22 L 38,42 L 44,22 L 48,32 L 56,32"
+        fill="none" stroke="#E65100" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

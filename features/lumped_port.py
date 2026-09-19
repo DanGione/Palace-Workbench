@@ -1,6 +1,7 @@
 import FreeCAD
 import os
-from features import add_to_simulation
+from features import find_port_group
+from features.object_group import add_to_port_group, cleanup_group_if_orphaned
 
 _ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "LumpedPort.svg")
 
@@ -41,6 +42,19 @@ class LumpedPort:
         _add(obj, "App::PropertyInteger", "MeshAttribute", "Mesh",
              "Gmsh physical surface attribute number", 11)
 
+    def onChanged(self, obj, prop):
+        if prop == "PortIndex":
+            if hasattr(obj, "MeshAttribute"):
+                obj.MeshAttribute = 10 + obj.PortIndex
+            # Label stays permanently locked to PortIndex -- shared "Port N"
+            # naming with WavePort (same numbering sequence, so the label
+            # must read the same way regardless of port type), auto-synced
+            # rather than set once at creation so it can never drift out of
+            # sync the way it used to (verified on a real board: a port's
+            # Name, Label, and PortIndex had all drifted to different
+            # numbers after enough create/delete/edit cycles).
+            obj.Label = f"Port {obj.PortIndex}"
+
     def execute(self, obj):
         if not (hasattr(obj, "PortEdges") and obj.PortEdges):
             return
@@ -63,6 +77,10 @@ class LumpedPort:
 
     def onDocumentRestored(self, obj):
         self._init_properties(obj)
+        if hasattr(obj, "PortIndex") and hasattr(obj, "MeshAttribute"):
+            obj.MeshAttribute = 10 + obj.PortIndex
+        if hasattr(obj, "PortIndex"):
+            obj.Label = f"Port {obj.PortIndex}"
         if not hasattr(obj, "Group"):
             try:
                 obj.addExtension("App::GroupExtensionPython")
@@ -119,6 +137,10 @@ class ViewProviderLumpedPort:
         self.setEdit(vobj)
         return True
 
+    def onDelete(self, vobj, subelements):
+        cleanup_group_if_orphaned(vobj.Object.Document, find_port_group, vobj.Object)
+        return True
+
     def __getstate__(self):
         return None
 
@@ -168,6 +190,6 @@ def create_lumped_port(doc, index=1, faces=None, edge_refs=None):
 
     if obj.ViewObject is not None:
         ViewProviderLumpedPort(obj.ViewObject)
-    add_to_simulation(doc, obj)
+    add_to_port_group(doc, obj)
     doc.recompute()
     return obj

@@ -1,6 +1,7 @@
 import FreeCAD
 import os
-from features import add_to_simulation
+from features import find_impedance_boundary_group
+from features.object_group import add_to_impedance_boundary_group, cleanup_group_if_orphaned
 
 _ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons",
                      "ImpedanceBoundary.svg")
@@ -195,6 +196,8 @@ class ImpedanceBoundary:
         _update_readonly(obj)
 
     def onChanged(self, obj, prop):
+        if prop == "PortIndex" and hasattr(obj, "MeshAttribute"):
+            obj.MeshAttribute = 10 + obj.PortIndex
         if prop == "SurfaceMode":
             _update_readonly(obj)
         if prop in ("GroupColor", "GroupTransparency"):
@@ -203,6 +206,8 @@ class ImpedanceBoundary:
 
     def onDocumentRestored(self, obj):
         self._init_properties(obj)
+        if hasattr(obj, "PortIndex") and hasattr(obj, "MeshAttribute"):
+            obj.MeshAttribute = 10 + obj.PortIndex
         if not hasattr(obj, "Group"):
             try:
                 obj.addExtension("App::GroupExtensionPython")
@@ -272,6 +277,10 @@ class ViewProviderImpedanceBoundary:
         self.setEdit(vobj)
         return True
 
+    def onDelete(self, vobj, subelements):
+        cleanup_group_if_orphaned(vobj.Object.Document, find_impedance_boundary_group, vobj.Object)
+        return True
+
     def __getstate__(self):
         return None
 
@@ -320,6 +329,6 @@ def create_impedance_boundary(doc, index=1, faces=None, edge_refs=None):
 
     if obj.ViewObject is not None:
         ViewProviderImpedanceBoundary(obj.ViewObject)
-    add_to_simulation(doc, obj)
+    add_to_impedance_boundary_group(doc, obj)
     doc.recompute()
     return obj

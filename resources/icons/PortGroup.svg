@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Group background -->
+  <rect x="4" y="10" width="56" height="44" rx="5" fill="#E3F2FD" stroke="#1565C0" stroke-width="2.5"/>
+  <!-- Sine wave (echoes WavePort.svg) -->
+  <path d="M 10,32 Q 18,18 26,32 Q 34,46 42,32 Q 50,18 58,32"
+        fill="none" stroke="#1565C0" stroke-width="3" stroke-linecap="round"/>
+  <!-- Port plane marker -->
+  <line x1="10" y1="18" x2="10" y2="46" stroke="#0D47A1" stroke-width="3"/>
+</svg>
