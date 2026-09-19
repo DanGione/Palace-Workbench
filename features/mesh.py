@@ -6,12 +6,14 @@ last-generated .msh file.  Double-clicking opens MeshPanel where the engineer
 can inspect element/node counts and refine sizing before running a long solve.
 
 Uses Mesh::FeaturePython so the built-in C++ Mesh ViewProvider triggers a reliable
-viewport refresh whenever obj.Mesh is set in execute().  The Python VP registers two
-additional display modes built from coin3D:
-
-  "Colored Wireframe"  — surface triangles only, colored by Gmsh physical-group attribute
-  "With Volumes"       — same surface mesh + tet faces in thin lines for interior material
-                         regions (airbox = blue, dielectric = green, etc.)
+viewport refresh whenever obj.Mesh is set in execute().  The Python VP registers a
+single "Colored Wireframe" display mode built from coin3D, combining two node
+groups: surface triangles (colored by Gmsh physical-group attribute) and tet
+interior faces (dimmed, thin lines, for material regions — airbox = blue,
+dielectric = green, etc.). Both are always in the active scene graph; MeshPanel's
+"Visible Attributes" list is the only thing that decides what's actually drawn,
+via HiddenSurfAttributes/HiddenVolAttributes (see _update_colors()) — there is no
+separate FreeCAD Display Mode to switch to see volumes.
 
 Refresh path:
   CmdMesh.Activated() → execute() → obj.Mesh = ... → C++ VP repaint
@@ -279,6 +281,17 @@ class PalaceMesh:
              "Surface physical-group attribute numbers hidden from the 3D view", [])
         _add(obj, "App::PropertyIntegerList", "HiddenVolAttributes", "Mesh",
              "Volume physical-group attribute numbers hidden from the 3D view", [])
+        # Internal bookkeeping only -- lets execute() tell "a new mesh was just
+        # embedded" apart from "recompute reran for an unrelated reason" (see
+        # execute()). A plain in-memory Proxy attribute can't do this: it must
+        # survive save/reload so reopening a document doesn't look identical to
+        # "brand new mesh, never executed" and wipe a saved Visible Attributes
+        # selection. Re-applied unconditionally since property *status* flags
+        # (unlike the value) aren't guaranteed to survive save/reload.
+        _add(obj, "App::PropertyFloat", "_LastMeshMtime", "Mesh",
+             "Internal: mtime of the last embedded mesh file execute() has "
+             "already accounted for.", 0.0)
+        obj.setPropertyStatus("_LastMeshMtime", "Hidden")
 
     def execute(self, obj):
         # obj.Mesh only exists on Mesh::FeaturePython; guard for old App::FeaturePython
@@ -295,6 +308,33 @@ class PalaceMesh:
                 return
             # Store parsed data on the VP proxy so updateData("Mesh") can colour it
             # without parsing the file a second time.
+            # Default a freshly-generated mesh to nothing visible -- opt-in via
+            # the Mesh Panel's "Visible Attributes" list, not a default that
+            # renders every surface/volume (expensive on a large mesh). Only do
+            # this when the embedded file's content has actually changed since
+            # the last execute() -- execute() also reruns on any incidental
+            # recompute (e.g. the Mesh Panel's accept() always calls
+            # doc.recompute() after applying sizing settings, whether or not a
+            # new mesh was generated), and resetting visibility every time that
+            # happens would silently discard the user's chosen Visible
+            # Attributes. MeshFile's *resolved path* is not a usable signal for
+            # this -- App::PropertyFileIncluded reuses the same resolved path
+            # across re-embeds under the same archive name (confirmed
+            # empirically), even when the content is a genuinely new mesh -- so
+            # this compares the file's mtime instead, which does change on
+            # every re-embed. _LastMeshMtime (a persisted property, not just a
+            # Proxy attribute -- Proxy state doesn't survive save/reload) is
+            # what makes this work correctly across a document reopen too: a
+            # freshly-created object's _LastMeshMtime defaults to 0.0, so its
+            # very first execute() after real mesh generation always resets
+            # (nothing to protect yet); a reopened document's _LastMeshMtime
+            # already matches the saved mesh's mtime, so its first execute()
+            # this session does NOT re-hide a previously saved selection.
+            mtime = os.path.getmtime(mesh_file)
+            if mtime != obj._LastMeshMtime:
+                obj.HiddenSurfAttributes = sorted(set(surf_groups))
+                obj.HiddenVolAttributes  = sorted(set(vol_groups))
+            obj._LastMeshMtime = mtime
             if FreeCAD.GuiUp and obj.ViewObject and obj.ViewObject.Proxy:
                 vp = obj.ViewObject.Proxy
                 vp._parsed = (verts, surf_tris, surf_groups, vol_tris, vol_groups)
@@ -365,7 +405,7 @@ class ViewProviderPalaceMesh:
         surf_ds.style.setValue(coin.SoDrawStyle.LINES)
         surf_ds.lineWidth.setValue(1.0)
 
-        # --- "Colored Wireframe" separator: surface triangles ---
+        # --- Surface triangles ---
         surf_sep = coin.SoSeparator()
         surf_sep.addChild(hints)
         surf_sep.addChild(surf_ds)
@@ -374,7 +414,6 @@ class ViewProviderPalaceMesh:
         surf_sep.addChild(self._coords)
         surf_sep.addChild(self._face_set)
         self._sep_colored = surf_sep
-        vobj.addDisplayMode(surf_sep, "Colored Wireframe")
 
         # --- Volume (tet) geometry nodes ---
         self._vol_coords   = coin.SoCoordinate3()
@@ -397,11 +436,15 @@ class ViewProviderPalaceMesh:
         vol_sep.addChild(self._vol_face_set)
         self._vol_sep = vol_sep
 
-        # --- "With Volumes" separator: surface + tet interior ---
-        with_vol_sep = coin.SoSeparator()
-        with_vol_sep.addChild(surf_sep)   # reuse surface sep (coin3D DAG is fine)
-        with_vol_sep.addChild(vol_sep)
-        vobj.addDisplayMode(with_vol_sep, "With Volumes")
+        # --- "Colored Wireframe" separator: surface + tet interior together.
+        # Per-attribute visibility (HiddenSurfAttributes/HiddenVolAttributes,
+        # see _update_colors()) is the only thing gating what's actually drawn
+        # — there is no separate "surfaces only" display mode to remember to
+        # switch away from.
+        combined_sep = coin.SoSeparator()
+        combined_sep.addChild(surf_sep)
+        combined_sep.addChild(vol_sep)
+        vobj.addDisplayMode(combined_sep, "Colored Wireframe")
 
         # Activate our colored mode as the default for new objects.
         try:
@@ -478,7 +521,7 @@ class ViewProviderPalaceMesh:
         return
 
     def getDisplayModes(self, vobj):
-        return ["Colored Wireframe", "With Volumes"]
+        return ["Colored Wireframe"]
 
     def getDefaultDisplayMode(self):
         return "Colored Wireframe"
