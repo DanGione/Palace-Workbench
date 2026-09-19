@@ -58,25 +58,32 @@ Double-click PalaceSimulation and set the **Palace binary** field to the full pa
 
 **Mesh generation fails immediately with no output**
 
-Check the FreeCAD Report View (View → Panels → Report View) for Gmsh error messages. Common causes:
+Check the FreeCAD Report View (View → Panels → Report View) for mesher error messages. Common causes:
 
 - The Airbox solid is not assigned (open the Airbox panel and assign a solid).
 - A material group references a deleted or renamed body.
 - The model has zero-volume bodies or non-manifold geometry. Run **Part → Check Geometry** to find issues.
 
-**Mesh is very coarse or very fine**
+**Mesh is very coarse or very fine (Gmsh backend)**
 
 Adjust **Max element size** in the Mesh panel. If you leave it blank, Gmsh uses its own heuristic which can be either too coarse or too fine depending on model scale. A good starting point is `λ_max / 10` at your highest simulation frequency, in model units.
 
 For a 5 GHz simulation in mm: λ = 300/5 = 60 mm in free space; substrate-loaded, roughly 30 mm; λ/10 ≈ 3 mm max element size.
 
-**Mesh generation is very slow**
+If you're on the **Netgen** backend instead, there is no equivalent manual
+knob — it sizes elements automatically from the geometry. If the automatic
+result is consistently too coarse or too fine for your model, that's a sign
+to switch to the Gmsh backend for this board rather than look for a hidden
+Netgen sizing setting; see [Simulation Reference → Choosing a mesh
+backend](simulation-reference.md#choosing-a-mesh-backend).
 
-The mesh is too fine. Check your element size settings. A fine **Conductor size** (e.g., 0.01 mm) with no **Refine distance** set will refine the entire model near every conductor face. Either increase Conductor size or set a Refine distance to limit how far the refinement reaches — but don't swing too far the other way, see the floor described just below and in [Simulation Reference → Mesh panel](simulation-reference.md#mesh-panel).
+**Mesh generation is very slow (Gmsh backend)**
+
+The mesh is too fine. Check your element size settings. A fine **Conductor size** (e.g., 0.01 mm) with no **Refine distance** set will refine the entire model near every conductor face. Either increase Conductor size or set a Refine distance to limit how far the refinement reaches — but don't swing too far the other way, see the floor described just below and in [Simulation Reference → Mesh panel](simulation-reference.md#mesh-panel). A manually-set **Conductor size**/**Port size** left over from Gmsh tuning has no effect on the Netgen backend (it's ignored, not slow) — if a mesh that used to be fast under Gmsh is slow after switching to Netgen, the cause is elsewhere; check the model's actual feature sizes instead.
 
 **Palace warns about low mesh quality / results look wrong even though meshing "succeeded"**
 
-Palace checks tetrahedron quality after every mesh generation and warns (Report View + Palace console, and a Yes/No prompt on a single Run or the first pass of a sweep — see [Simulation Reference → Mesh quality check](simulation-reference.md#mesh-quality-check)) when it finds degenerate or sliver elements. Two distinct causes produce the same symptom:
+The workbench checks tetrahedron quality after every mesh generation and warns (Report View + Palace console, and a Yes/No prompt on a single Run or the first pass of a sweep — see [Simulation Reference → Mesh quality check](simulation-reference.md#mesh-quality-check)) when it finds degenerate or sliver elements. On the **Gmsh** backend, two distinct causes produce the same symptom (neither applies to Netgen, which doesn't use these sizing settings — if Netgen itself reports low quality, try the Gmsh backend on the same model instead of looking for an equivalent sizing fix):
 
 1. **One Conductor or Dielectric group mixing a very thin feature with a much larger body** — e.g. a 25–50 µm trace or ground-plane layer in the same group as a millimeter-scale connector shell or via barrel. **Conductor size** applies to every surface in that group, so:
 
@@ -114,8 +121,21 @@ Palace may have run but produced no valid output. Check the FreeCAD console for 
 
 **S21 is −300 dB or similar**
 
-- The receive port is not in the mesh (its assigned body is missing from the geometry tree or not found by Gmsh).
+- The receive port is not in the mesh (its assigned body is missing from the geometry tree or not found by the mesher).
 - The port index on the receive port doesn't match the one Palace solved for.
+
+**"Probe N could not be found! Using default value 0.0!" warnings at startup**
+
+Expected and harmless for a Wave Port with no **Integration edge** set (see
+[Ports Reference → Wave Port → Impedance calculation](ports-reference.md#impedance-calculation)) —
+Palace falls back to sampling a grid of field probes over the port face to
+compute impedance, and a few of those points can fall just outside the
+port's real (e.g. annular) cross-section, which is deliberately unmeshed
+conductor material. This doesn't affect the computed impedance or
+S-parameters (those probes simply contribute nothing) — it's log noise, not
+a sign of a meshing problem. If you'd rather not see it at all, set an
+**Integration edge** on the port (switches to Palace's native, more accurate
+impedance calculation and skips the probe grid entirely).
 
 ---
 

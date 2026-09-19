@@ -84,7 +84,7 @@ which are cleaned up automatically).
 | `results.nc` | the Simulation object | Single-run S-params, fields, port impedances |
 | `sweep.nc` | the Sweep object | All sweep/optimization iterations |
 | `palace_config.json` | the Simulation object | Palace configuration JSON that generated the last single Run |
-| `mesh.msh` | the Mesh object | Gmsh mesh file from the last Run/Sweep iteration |
+| `mesh.msh` | the Mesh object | Mesh file (Gmsh MSH2 format, regardless of which [mesh backend](simulation-reference.md#choosing-a-mesh-backend) produced it) from the last Run/Sweep iteration |
 | `geometry.step` | the Mesh object | STEP snapshot of the meshed geometry from the last Run/Sweep iteration |
 
 Use **Palace → Export Mesh…**, **Export Geometry…**, or **Export Config…** to

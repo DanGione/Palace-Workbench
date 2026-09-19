@@ -25,10 +25,11 @@ Double-click the **PalaceSimulation** object to open this panel. It has three ta
 
 | Field | Description |
 |---|---|
-| **Max element size** | Global maximum Gmsh element size in model units. 0 = Gmsh chooses automatically. |
-| **Min element size** | Global minimum element size. 0 = Gmsh chooses. |
+| **Backend** | `Gmsh` (default) or `Netgen` — which meshing engine `Generate Mesh`/`Run` uses. See [Choosing a mesh backend](#choosing-a-mesh-backend) below. |
+| **Max element size** | Global maximum Gmsh element size in model units. 0 = Gmsh chooses automatically. Ignored when Backend is Netgen. |
+| **Min element size** | Global minimum element size. 0 = Gmsh chooses. Ignored when Backend is Netgen. |
 
-These duplicate the settings in the Mesh panel (see below). The Simulation panel copy is provided for convenience; both control the same properties.
+The element size fields duplicate the settings in the Mesh panel (see below) — the Simulation panel copy is provided for convenience; both control the same properties. **Backend** exists only here, not in the Mesh panel.
 
 ---
 
@@ -118,9 +119,37 @@ The table updates to show the assigned override. Click a row to re-select that f
 
 Double-click the **PalaceMesh** object, or click the **Mesh Settings** toolbar button.
 
-### Element Sizing group
+### Choosing a mesh backend
 
-All sizes are in model units (mm if L0 = 1e-3).
+The engine choice itself — **Backend**, `Gmsh` (default) or `Netgen` — is set
+on the **Simulation** panel's General tab, in its Mesh group (see above), not
+here on the Mesh object. Both engines produce the same MSH2 mesh format; the
+choice only changes which one builds it, and everything else in this Mesh
+panel (Element Sizing, quality check, status) still applies to whichever
+mesh was last generated.
+
+**Gmsh** gives you manual control over element sizing (the Element Sizing
+group below) — useful when you need to force a specific resolution near a
+small feature, or when you're used to tuning these knobs already.
+
+**Netgen** sizes elements automatically from the geometry and generally needs
+no tuning at all — the Element Sizing fields below (**Max/Min element
+size**, **Conductor size**, **Port size**, **Refine distance**) are Gmsh-only
+settings and are **ignored** when Backend is set to Netgen. On several
+real boards tested during development, Netgen's automatic sizing produced
+meshes with fewer elements, faster generation, and equal or better quality
+than a hand-tuned Gmsh configuration, with no manual sizing at all. If you
+hit a case where Netgen's automatic sizing doesn't work well for your model,
+switching back to Gmsh (and tuning the Element Sizing fields per the guidance
+below) is the fallback.
+
+Both backends are meshed inside the same sandboxed subprocess, so a crash in
+either one is isolated from the main FreeCAD process the same way.
+
+### Element Sizing group (Gmsh backend only)
+
+All sizes are in model units (mm if L0 = 1e-3). These fields have no effect
+when **Backend** is set to Netgen.
 
 | Field | Description |
 |---|---|
@@ -157,10 +186,14 @@ you've confirmed the check still passes.
 
 ### Mesh quality check
 
-After every mesh generation, Palace checks the quality of the generated tetrahedra
-(Gmsh's `minSICN` measure — 1.0 is equilateral, 0 is degenerate, negative is inverted)
-and logs a pass/warn line to the FreeCAD Report View and the Palace debug console. If
-any elements fall below the threshold:
+After every mesh generation, the workbench checks the quality of the generated
+tetrahedra and logs a pass/warn line to the FreeCAD Report View and the Palace
+debug console — on the final, curved (2nd-order) elements Palace actually
+solves on, not the straight-sided mesh before curving. The underlying metric
+differs by backend (Gmsh's `minSICN`, or a curved scaled-Jacobian check for
+Netgen) but both report on the same 0–1 scale (1.0 equilateral, 0 degenerate,
+negative inverted) and the pass/warn behavior below is identical either way.
+If any elements fall below the threshold:
 
 - **Single "Generate Mesh" or "Generate && Run":** you're asked whether to proceed
   before the mesh is kept/the simulation launches.
@@ -187,4 +220,4 @@ A checklist of all mesh attribute groups (surface boundaries and volume domains)
 
 ### Generate Mesh button
 
-Equivalent to clicking the **Generate Mesh** toolbar button. Saves the current settings and runs Gmsh. Progress is reported in the FreeCAD Report View.
+Equivalent to clicking the **Generate Mesh** toolbar button. Saves the current settings and runs the selected mesh backend (Gmsh or Netgen, per **Backend** on the Simulation panel). Progress is reported in the FreeCAD Report View.
