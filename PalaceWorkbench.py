@@ -68,6 +68,8 @@ class PalaceWorkbench(FreeCADGui.Workbench):
         _ensure_dependencies()
         from commands.doc_events import register_once
         register_once()
+        from palace.embedded_files import reap_orphaned_scratch_dirs
+        reap_orphaned_scratch_dirs()
         from commands.cmd_simulation import CmdSimulation
         from commands.cmd_airbox import CmdAirbox
         from commands.cmd_lumped_port import CmdLumpedPort
@@ -77,7 +79,7 @@ class PalaceWorkbench(FreeCADGui.Workbench):
         from commands.cmd_material_group import CmdDielectricGroup, CmdConductorGroup
         from commands.cmd_component import CmdCreateComponent
         from commands.cmd_component_io import CmdExportComponent, CmdImportComponent
-        from commands.cmd_mesh import CmdMesh
+        from commands.cmd_mesh import CmdMesh, CmdStopMesh
         from commands.cmd_run import CmdRun, CmdRunOnly, CmdStopRun
         from commands.cmd_results import CmdViewResults
         from commands.cmd_export import CmdExportMesh, CmdExportGeometry, CmdExportConfig
@@ -95,6 +97,7 @@ class PalaceWorkbench(FreeCADGui.Workbench):
         FreeCADGui.addCommand("Palace_ExportComponent",  CmdExportComponent())
         FreeCADGui.addCommand("Palace_ImportComponent",  CmdImportComponent())
         FreeCADGui.addCommand("Palace_Mesh",            CmdMesh())
+        FreeCADGui.addCommand("Palace_StopMesh",        CmdStopMesh())
         FreeCADGui.addCommand("Palace_Run",             CmdRun())
         FreeCADGui.addCommand("Palace_RunOnly",         CmdRunOnly())
         FreeCADGui.addCommand("Palace_StopRun",         CmdStopRun())
@@ -121,6 +124,7 @@ class PalaceWorkbench(FreeCADGui.Workbench):
             "Palace_ImportComponent",
             "Separator",
             "Palace_Mesh",       # mesh only — inspect before solving
+            "Palace_StopMesh",
             "Palace_Run",        # generate mesh + run
             "Palace_RunOnly",    # run with existing mesh
             "Palace_StopRun",

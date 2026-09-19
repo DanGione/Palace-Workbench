@@ -3,7 +3,6 @@ import FreeCADGui
 import os
 import shutil
 import time
-import traceback
 
 try:
     from PySide2 import QtWidgets
@@ -23,28 +22,52 @@ def _fmt_elapsed(secs):
 
 
 class _MeshWorker(QThread):
-    """Runs generate_mesh in a background thread."""
+    """Runs mesh generation in a freecadcmd subprocess, streaming its output.
+
+    Gmsh's C++ core can't be interrupted mid-call from Python, and a crash
+    inside it can take the whole FreeCAD process down -- running it as a
+    real subprocess (see palace/mesh_runner.py) makes it killable via stop()
+    and crash-isolated, the same reasons Palace itself runs as a subprocess.
+    """
 
     log = Signal(str)            # progress messages (marshaled to main thread)
-    done = Signal(bool, object)  # success: (mesh_path, geometry_path, quality); failure: traceback str
+    done = Signal(bool, object)  # success: (mesh_path, geometry_path, quality); failure: error str
 
-    def __init__(self, doc, output_dir, gmsh_instance, parent=None):
+    def __init__(self, doc, output_dir, parent=None):
         super().__init__(parent)
         self._doc = doc
         self._output_dir = output_dir
-        self._gmsh = gmsh_instance
+        self._proc = None
+        self._cancelled = False
+
+    def stop(self):
+        from palace.mesh_runner import kill_mesh_process
+        self._cancelled = True
+        kill_mesh_process(self._proc)
 
     def run(self):
-        from palace.meshing import generate_mesh
+        from palace.mesh_runner import generate_mesh_subprocess
+
+        def _store_proc(p):
+            self._proc = p
+
         try:
-            mesh_path, geometry_path, quality = generate_mesh(
+            mesh_path, geometry_path, quality = generate_mesh_subprocess(
                 self._doc, self._output_dir,
                 log_fn=self.log.emit,
-                _gmsh_instance=self._gmsh,
+                proc_callback=_store_proc,
             )
             self.done.emit(True, (mesh_path, geometry_path, quality))
-        except Exception:
-            self.done.emit(False, traceback.format_exc())
+        except Exception as exc:
+            if self._cancelled:
+                self.log.emit("Palace: *** MESHING ABORTED — process killed ***\n")
+                self.done.emit(False, "Meshing cancelled by user")
+                return
+            # generate_mesh_subprocess() already raises with the subprocess's
+            # full accumulated output (including its own nested traceback if
+            # it failed) as the message -- str(exc) is that text directly,
+            # without an extra layer of this-file's-own traceback framing.
+            self.done.emit(False, str(exc))
 
 
 class CmdMesh:
@@ -55,7 +78,8 @@ class CmdMesh:
             "Pixmap": _ICON,
             "MenuText": "Generate Mesh",
             "ToolTip": (
-                "Generate the Gmsh mesh and save it to disk.\n"
+                "Generate the mesh (Gmsh or Netgen, per the Simulation "
+                "object's Mesh Backend setting) and save it to disk.\n"
                 "Inspect node/element counts in the Mesh object before\n"
                 "running the Palace solver."
             ),
@@ -96,16 +120,6 @@ class CmdMesh:
             FreeCAD.Console.PrintMessage(msg if msg.endswith("\n") else msg + "\n")
             if console is not None:
                 console.write(msg)
-
-        # gmsh.initialize() registers Python signal handlers — must run on the
-        # main thread.  Everything after that is safe in a background thread.
-        try:
-            from palace.meshing import init_gmsh_main_thread
-            gmsh_instance = init_gmsh_main_thread()
-        except Exception as exc:
-            _log(f"Palace: Failed to initialise Gmsh: {exc}\n")
-            QtWidgets.QMessageBox.critical(None, "Mesh Error", str(exc))
-            return
 
         _t0_mesh = time.time()
 
@@ -153,6 +167,7 @@ class CmdMesh:
                 if console is not None:
                     console.set_status(f"Mesh complete ({elapsed})")
             else:
+                shutil.rmtree(mesh_dir, ignore_errors=True)
                 FreeCAD.Console.PrintError(f"Palace meshing failed:\n{result}\n")
                 if console is not None:
                     console.write(f"ERROR:\n{result}\n")
@@ -162,7 +177,39 @@ class CmdMesh:
                 )
 
         _log("Palace: Generating mesh…\n")
-        CmdMesh._worker = _MeshWorker(doc, mesh_dir, gmsh_instance)
+        CmdMesh._worker = _MeshWorker(doc, mesh_dir)
         CmdMesh._worker.log.connect(_log)
         CmdMesh._worker.done.connect(_on_done)
         CmdMesh._worker.start()
+
+
+_STOP_ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "Stop.svg")
+
+
+class CmdStopMesh:
+    def GetResources(self):
+        return {
+            "Pixmap": _STOP_ICON,
+            "MenuText": "Stop Meshing",
+            "ToolTip": "Terminate the mesh generation that is currently running.",
+        }
+
+    def IsActive(self):
+        return CmdMesh._worker is not None and CmdMesh._worker.isRunning()
+
+    def Activated(self):
+        worker = CmdMesh._worker
+        if worker is None or not worker.isRunning():
+            return
+        reply = QtWidgets.QMessageBox.question(
+            None,
+            "Stop Meshing",
+            "Terminate the mesh generation currently running?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if reply == QtWidgets.QMessageBox.Yes:
+            worker.stop()
+            FreeCAD.Console.PrintMessage(
+                "Palace: Stop requested — waiting for mesh process to exit…\n"
+            )
