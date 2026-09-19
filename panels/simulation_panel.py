@@ -8,6 +8,7 @@ except ImportError:
     from PySide6 import QtCore, QtGui, QtWidgets
 
 _SIM_TYPES = ["Driven", "Eigenmode", "Electrostatic"]
+_MESH_BACKENDS = ["Gmsh", "Netgen"]
 
 # Column indices for the samples table
 _COL_TYPE  = 0
@@ -95,6 +96,14 @@ class SimulationPanel:
 
         mesh_grp = QtWidgets.QGroupBox("Mesh")
         mfl = QtWidgets.QFormLayout(mesh_grp)
+        self.combo_mesh_backend = QtWidgets.QComboBox()
+        self.combo_mesh_backend.addItems(_MESH_BACKENDS)
+        self.combo_mesh_backend.setToolTip(
+            "Meshing engine used by Generate Mesh / Run. Netgen sizes "
+            "automatically -- the element size fields below are Gmsh-only "
+            "and ignored when Netgen is selected."
+        )
+        mfl.addRow("Backend:", self.combo_mesh_backend)
         self.edit_cl_max = QtWidgets.QLineEdit()
         self.edit_cl_max.setToolTip(
             "Gmsh CharacteristicLengthMax in model units. 0 = let Gmsh decide."
@@ -459,6 +468,10 @@ class SimulationPanel:
         self.spin_maxiter.setValue(o.ElecMaxIter)
         self.edit_tol.setText(str(o.ElecTol))
 
+        backend = getattr(o, "MeshBackend", "Gmsh")
+        self.combo_mesh_backend.setCurrentIndex(
+            _MESH_BACKENDS.index(backend) if backend in _MESH_BACKENDS else 0
+        )
         self.edit_cl_max.setText(str(o.MeshCharacteristicLengthMax))
         self.edit_cl_min.setText(str(o.MeshCharacteristicLengthMin))
 
@@ -519,6 +532,7 @@ class SimulationPanel:
         o.ElecMaxIter = self.spin_maxiter.value()
         o.ElecTol     = self._float(self.edit_tol, o.ElecTol)
 
+        o.MeshBackend = _MESH_BACKENDS[self.combo_mesh_backend.currentIndex()]
         o.MeshCharacteristicLengthMax = self._float(
             self.edit_cl_max, o.MeshCharacteristicLengthMax
         )

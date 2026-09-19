@@ -12,14 +12,15 @@ def _add(obj, type_, name, group, tip, value=None):
 
 
 def _is_palace_child(o):
+    # LumpedPort/WavePort/ImpedanceBoundary are deliberately NOT matched here
+    # -- they now have a dedicated one-level-deeper home (PortGroup/
+    # ImpedanceBoundaryGroup, features/object_group.py's sync_all_groups,
+    # called separately in onDocumentRestored below) rather than landing
+    # directly in this Simulation's own Group.
     return (
         hasattr(o, "OuterBoundaryType") or
         (hasattr(o, "Permittivity") and hasattr(o, "MeshAttribute")) or
-        (hasattr(o, "ConductorType") and hasattr(o, "MeshAttribute")) or
-        (hasattr(o, "Rs") and hasattr(o, "MeshAttribute")) or          # ImpedanceBoundary
-        (hasattr(o, "PortIndex") and hasattr(o, "R") and hasattr(o, "C")
-         and not hasattr(o, "Rs")) or                                   # LumpedPort
-        (hasattr(o, "PortIndex") and hasattr(o, "NumModes") and not hasattr(o, "R"))
+        (hasattr(o, "ConductorType") and hasattr(o, "MeshAttribute"))
     )
 
 
@@ -63,11 +64,17 @@ class SimulationContainer:
              "Whether the S-Parameter panel's renormalization is applied — persisted so it "
              "survives document close/reopen and simulation re-runs.", False)
 
-        # Mesh sizing
+        # Mesh backend + sizing
+        _add(obj, "App::PropertyEnumeration", "MeshBackend", "Mesh",
+             "Meshing engine used by Generate Mesh / Run")
+        if hasattr(obj, "MeshBackend"):
+            obj.MeshBackend = ["Gmsh", "Netgen"]
         _add(obj, "App::PropertyFloat", "MeshCharacteristicLengthMax", "Mesh",
-             "Global maximum element size in model units (0 = Gmsh default)", 0.0)
+             "Global maximum element size in model units (0 = Gmsh default; "
+             "ignored by Netgen, which sizes automatically)", 0.0)
         _add(obj, "App::PropertyFloat", "MeshCharacteristicLengthMin", "Mesh",
-             "Global minimum element size in model units (0 = Gmsh default)", 0.0)
+             "Global minimum element size in model units (0 = Gmsh default; "
+             "ignored by Netgen, which sizes automatically)", 0.0)
 
         # Driven
         _add(obj, "App::PropertyFloat", "DrivenMinFreq", "Driven Solver",
@@ -121,6 +128,8 @@ class SimulationContainer:
     def onDocumentRestored(self, obj):
         self._init_properties(obj)
         self._migrate_to_group(obj)
+        from features.object_group import sync_all_groups
+        sync_all_groups(obj.Document)
         from palace.embedded_files import migrate_legacy_string_property, legacy_sibling_path
         migrate_legacy_string_property(
             obj, "ResultsFile", "Palace",
