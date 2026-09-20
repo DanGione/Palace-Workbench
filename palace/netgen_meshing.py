@@ -162,8 +162,36 @@ def _dist_sq(a, b):
     return sum((x - y) ** 2 for x, y in zip(a, b))
 
 
-def _match_reference(com, reference):
-    """Nearest-COM match against a (label, com, kind, attr) reference list.
+def _as_occ_solid(geom):
+    """Return geom as a netgen.occ shape, converting a FreeCAD Part.Shape
+    via a one-time BREP roundtrip if it isn't already one.
+
+    Reference entries built before any conductor/port import (background
+    dielectrics/airbox -- see _match_reference's first call site) only have
+    a FreeCAD Part.Shape on hand at that point, since nothing has gone
+    through netgen.occ yet. Conversion is deferred to here, called only
+    when a genuine COM tie needs geometric containment to resolve, so it
+    never costs anything for the common, unambiguous case.
+    """
+    if not hasattr(geom, "exportBrep"):
+        return geom  # already netgen.occ -- conductor and re-identified
+                     # background entries are native from construction.
+    occ, _ngm = _netgen()
+    brep_path = tempfile.mktemp(suffix=".brep")
+    try:
+        geom.exportBrep(brep_path)
+        return occ.OCCGeometry(brep_path).shape
+    finally:
+        try:
+            os.unlink(brep_path)
+        except OSError:
+            pass
+
+
+def _match_reference(candidate, reference, log_fn=None):
+    """Nearest-COM match against a (label, com, kind, attr, volume, geom)
+    reference list, with a geometric-containment tiebreak for entries that
+    are equally close (a coaxial/concentric case COM alone cannot resolve).
 
     Netgen's Glue() does not reliably propagate .name through *nested*
     containment (airbox containing dielectric containing conductor -- this
@@ -171,13 +199,100 @@ def _match_reference(com, reference):
     touching or disjoint solids -- verified with a minimal repro. COM
     matching is the same technique palace.meshing._match_vol_by_com already
     uses on the Gmsh side, and is what actually works here.
+
+    COM alone is not enough, though: solids that are coaxial and axially
+    centered at the same point -- a coax cable's center pin, its
+    surrounding annular dielectric spacer, and its outer shield tube, when
+    the spacer and shield happen to be the same length -- all share the
+    same center of mass, and "nearest COM" cannot rank entries that are
+    exactly (or near-exactly) tied. Confirmed on a real board, in two
+    different ways from what looks like the same underlying ambiguity:
+    first the whole PTFE spacer (volume 47.6) matched the coax pin's own
+    conductor reference (volume 6.2), then -- after restricting candidates
+    to ones large enough to actually contain the fragment -- the outer
+    shield tube (volume 41.2, smaller than the spacer's 47.6, so it still
+    passed that restriction) matched the *spacer's* reference instead of
+    its own. A volume floor alone cannot fix this -- it only rules out
+    references too small to be a match, and multiple references can still
+    be "big enough" while only one is actually correct -- and even a
+    closest-volume tiebreak is still just a heuristic: an asymmetrically
+    fragmented concentric layer could in principle have its reduced volume
+    land closer to some other tied entry's full volume than to its own.
+
+    The real, decisive test is geometric containment, not a volume
+    estimate: does the candidate solid actually sit inside a tied
+    reference's own original geometry? Confirmed empirically (synthetic
+    coaxial pin/spacer/shield-tube geometry matching this real case)
+    that netgen.occ's own `*` (Boolean intersection) operator answers this
+    cleanly with no extra roundtrip needed between two already-netgen.occ
+    shapes: a candidate intersected with its true parent returns its own
+    full volume; intersected with a *touching* but different material --
+    exactly the adjacency concentric layers have with each other -- returns
+    exactly 0.0, not some noisy near-zero value. So: rank by COM distance
+    first, same as always (cheap, and correct for the vast majority of
+    solids that aren't part of any such ambiguity). Only when two or more
+    entries are tied to within `tie_tol` (BREP/COM roundoff, not a real
+    physical separation -- genuinely different materials essentially never
+    coincide this tightly by accident) is the expensive check even run, and
+    then only among the tied entries: convert each tied entry's `geom` to a
+    netgen.occ shape if it isn't one already (`_as_occ_solid`), intersect
+    with the candidate, and pick whichever gives the largest overlap.
+
+    OCC Booleans can fail on pathological geometry (an established, handled
+    risk elsewhere in this file -- see _fuse_group_solids). If the
+    containment check raises, or every tied entry's overlap comes back
+    zero (inconclusive -- e.g. a genuinely-touching-only situation this
+    function was never meant to adjudicate), this falls back to the
+    original closest-volume heuristic among the tied entries, logging a
+    warning via `log_fn` either way so a real ambiguity doesn't resolve
+    silently on the weaker fallback. This never raises and never returns
+    None.
+
+    Used at two call sites, both prone to the exact same ambiguity: once to
+    identify each background (airbox/dielectric) solid straight off the
+    STEP re-import, before any conductor enters the picture (a dielectric
+    shell concentric with the airbox itself, or with another dielectric,
+    would hit this here even with no conductor at all), and again for every
+    solid Glue() produces once conductors, ports, and integration edges are
+    all combined in. One implementation, reused, rather than a second
+    hand-rolled nearest-COM loop with a weaker guarantee.
     """
-    best, best_d = None, float("inf")
-    for entry in reference:
-        d = _dist_sq(com, entry[1])
-        if d < best_d:
-            best_d, best = d, entry
-    return best
+    if log_fn is None:
+        log_fn = lambda msg: None
+
+    com = tuple(candidate.center)
+    mass = candidate.mass
+
+    scored = [(_dist_sq(com, entry[1]), entry) for entry in reference]
+    best_d = min(d for d, _ in scored)
+    tie_tol = 1e-6  # squared mm -- ~1 micron; see docstring
+    tied = [entry for d, entry in scored if d - best_d <= tie_tol]
+    if len(tied) == 1:
+        return tied[0]
+
+    try:
+        best_entry, best_overlap = None, -1.0
+        for entry in tied:
+            overlap = (candidate * _as_occ_solid(entry[5])).mass
+            if overlap > best_overlap:
+                best_overlap, best_entry = overlap, entry
+        if best_overlap > 0.0:
+            return best_entry
+        log_fn(
+            "Palace: WARNING — geometric containment check found no real "
+            f"overlap among {len(tied)} COM-tied candidates for a solid "
+            "of mass "
+            f"{mass:.4g} -- falling back to closest-volume match.\n"
+        )
+    except Exception as exc:
+        log_fn(
+            "Palace: WARNING — geometric containment check failed "
+            f"({exc}) among {len(tied)} COM-tied candidates for a solid "
+            f"of mass {mass:.4g} -- falling back to closest-volume "
+            "match.\n"
+        )
+
+    return min(tied, key=lambda entry: abs(entry[4] - mass) / entry[4] if entry[4] else float("inf"))
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +454,17 @@ def _match_occ_faces(candidate_faces, fc_face, min_tol=0.05):
     face's plane purely from the box being so short. Checking only the
     centroid can't tell a genuinely flat, coplanar sub-piece from a
     perpendicular face that merely straddles the same plane at its middle.
+
+    The containment check itself also needs to look past the centroid, not
+    just judge flatness that way: on a real board, a large, genuinely flat
+    fragment of the airbox's own wall (35mm^2, an oddly-shaped remainder
+    left over once the wall was fragmented around a wave port's own
+    rectangle) had a centroid that geometrically fell inside the port's
+    50mm^2 target footprint even though the fragment's own extent reached
+    2.5mm beyond the target's edge on both sides -- passing the area cap
+    (since 35 < 50) and the flatness check (it's genuinely coplanar) but
+    still not a real sub-piece of fc_face. Every vertex of the candidate,
+    not just its centroid, must also lie within fc_face's own boundary.
     """
     import Part as FCPart
 
@@ -367,6 +493,9 @@ def _match_occ_faces(candidate_faces, fc_face, min_tol=0.05):
             continue
         dist, _, _ = fc_face.distToShape(FCPart.Vertex(FreeCAD.Vector(*c)))
         if dist > tol:
+            continue
+        if any(fc_face.distToShape(FCPart.Vertex(FreeCAD.Vector(*v.p)))[0] > tol
+               for v in verts):
             continue
         matched.append(f)
     return matched
@@ -845,25 +974,33 @@ def generate_mesh_netgen(doc, output_dir, log_fn=None):
     bg_solids = list(background_shape.solids)
     log_fn(f"Palace: {len(bg_solids)} background solid(s) loaded from STEP\n")
 
-    # Reference list for COM matching: (label, com, kind, mesh_attribute)
+    # Reference list for COM matching: (label, com, kind, mesh_attribute,
+    # volume, geom) -- geom is a FreeCAD Part.Shape here, the only thing
+    # available before anything has gone through netgen.occ; _match_reference
+    # converts it lazily, only if a tie ever needs geometric containment.
     reference = []
-    solid_manifest = [{"kind": "airbox", "label": _airbox_solid.Label,
-                        "com": tuple(_airbox_solid.Shape.CenterOfGravity),
-                        "attr": 1}]
+    solid_manifest = [
+        ("airbox:" + _airbox_solid.Label, tuple(_airbox_solid.Shape.CenterOfGravity),
+         "airbox", 1, _airbox_solid.Shape.Volume, _airbox_solid.Shape),
+    ]
     for grp, solid in diel_bodies:
-        solid_manifest.append({
-            "kind": "dielectric", "label": solid.Label,
-            "com": tuple(solid.Shape.CenterOfGravity), "attr": grp.MeshAttribute,
-        })
+        solid_manifest.append((
+            "dielectric:" + solid.Label, tuple(solid.Shape.CenterOfGravity),
+            "dielectric", grp.MeshAttribute, solid.Shape.Volume, solid.Shape,
+        ))
+    # Same ambiguity _match_reference's own docstring covers can arise here
+    # too, even with no conductor in the picture yet -- e.g. a dielectric
+    # shell concentric with the airbox itself, or with another dielectric.
+    # Reuse the one tested implementation rather than a second hand-rolled
+    # nearest-COM loop.
     for s in bg_solids:
         com = tuple(s.center)
-        best, best_d = None, float("inf")
-        for m in solid_manifest:
-            d = _dist_sq(com, m["com"])
-            if d < best_d:
-                best_d, best = d, m
-        reference.append((best["kind"] + ":" + best["label"], com, best["kind"], best["attr"]))
-        s.name = best["kind"] + ":" + best["label"]
+        label, _com, kind, attr, _vol, _geom = _match_reference(s, solid_manifest, log_fn)
+        # geom = s itself (already netgen.occ, from this STEP re-import) --
+        # keeps the second call site's containment checks free of any
+        # FreeCAD roundtrip even though this material started life as one.
+        reference.append((label, com, kind, attr, s.mass, s))
+        s.name = label
 
     # --- Conductors: fuse + BREP export, exactly mirroring
     # _import_conductor_solids's approach. --------------------------------
@@ -891,7 +1028,7 @@ def generate_mesh_netgen(doc, output_dir, log_fn=None):
             com = tuple(s.center)
             entry_label = "cond:" + grp.Label
             s.name = entry_label
-            reference.append((entry_label, com, "conductor", grp.MeshAttribute))
+            reference.append((entry_label, com, "conductor", grp.MeshAttribute, s.mass, s))
         conductor_shapes.append(cshape)
         log_fn(f"Palace: Conductor '{grp.Label}' -> "
                f"{len(list(cshape.solids))} solid(s) imported\n")
@@ -1024,7 +1161,7 @@ def generate_mesh_netgen(doc, output_dir, log_fn=None):
 
     resolved = []   # (solid, label, kind, attr)
     for s in glued_solids:
-        label, com, kind, attr = _match_reference(tuple(s.center), reference)
+        label, com, kind, attr, _volume, _geom = _match_reference(s, reference, log_fn)
         s.name = label
         resolved.append((s, label, kind, attr))
 

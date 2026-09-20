@@ -393,7 +393,7 @@ used (`palace/mesh_runner.py`/`mesh_worker_main.py`) — no separate venv
 needed, confirmed by installing it alongside `gmsh` in the same `pip install`
 line with no conflict.
 
-Three real, production-confirmed bugs fixed here that must not regress:
+Four real, production-confirmed bugs fixed here that must not regress:
 
 - **Internal material-interface faces must never inherit the outer-boundary
   default.** A `FaceDescriptor` nobody explicitly `.bc()`-tagged keeps
@@ -419,10 +419,81 @@ Three real, production-confirmed bugs fixed here that must not regress:
   have its centroid sit within the plane-distance tolerance purely because
   the box is short — rejected by requiring every one of the candidate's own
   vertices, not just its centroid, to lie within a small **fixed** (not
-  area-scaled) tolerance of the target's plane. Full reasoning for both,
-  plus the original annular-port centroid-mismatch case the scaled tolerance
+  area-scaled) tolerance of the target's plane. A third variant hits the
+  containment check itself: a large, genuinely flat and coplanar fragment
+  of the airbox's own wall can still have a centroid that geometrically
+  falls inside a smaller target face's own footprint (not just "near" it —
+  literally inside its 2-D boundary) while the fragment's own extent
+  reaches well beyond the target's edge — confirmed on a real board,
+  2.5mm past the target's own edge on both sides, at two different wave
+  ports simultaneously. The area cap doesn't catch it (the fragment was
+  *smaller* than the target), so every one of the candidate's own
+  vertices, not just its centroid, must also lie within the target's own
+  boundary via `distToShape`. Full reasoning for all three variants, plus
+  the original annular-port centroid-mismatch case the scaled tolerance
   exists for, is in the function's own docstring — read it before touching
   this function again.
+- **`_match_reference` needs a geometric-containment tiebreak for entries
+  tied on center of mass**, not a volume-based heuristic. Solids that are
+  coaxial and axially centered at the same point — a coax cable's center
+  pin, its surrounding annular dielectric spacer, and its outer shield
+  tube, when the spacer and shield happen to be the same length — all
+  share a center of mass, and nearest-COM alone cannot rank entries that
+  are exactly (or near-exactly) tied. Confirmed on a real board across
+  three rounds of hardening: first the whole PTFE spacer (volume 47.6)
+  matched the coax pin's own conductor reference (volume 6.2) purely
+  because their COMs coincided, silently excluding the whole dielectric
+  from the 3-D mesh (conductor volumes are removed, not meshed as a
+  domain) and PEC-tagging every one of its faces — including both flat
+  end-caps — as if they were the conductor's own. A volume-floor fix
+  (reject any reference entry too small to contain the candidate) wasn't
+  enough — confirmed by testing it against the same document: the shield
+  tube (volume 41.2) is smaller than the spacer (47.6), so it still passed
+  the floor, and the tube itself then started matching the spacer's
+  reference instead of its own. A closest-volume tiebreak fixed that
+  specific case but is still only a heuristic — an asymmetrically
+  fragmented layer could in principle have its reduced volume land closer
+  to some *other* tied entry's full volume than to its own.
+
+  The actual fix: rank by COM distance first, same as always (cheap, and
+  correct for the vast majority of solids with no such ambiguity at all).
+  Only when two or more entries are tied to within `tie_tol` (~1 micron —
+  BREP/COM roundoff, not a real physical separation) is the real,
+  decisive question asked instead of estimated — does the candidate solid
+  actually sit inside a tied reference's own original geometry? Verified
+  empirically that `netgen.occ`'s own `*` (Boolean intersection) operator
+  answers this cleanly, with no roundtrip needed between two shapes
+  already in that kernel: a candidate intersected with its true parent
+  returns its own full volume; intersected with a merely-*touching*
+  different material — the exact adjacency concentric layers have with
+  each other — returns exactly `0.0`. Reference entries now carry the
+  actual geometry needed for this (a 6th tuple field, `geom`) — a netgen.occ
+  solid where one is already in hand (conductor entries, and background
+  entries once identified), or a FreeCAD `Part.Shape` where nothing else
+  exists yet (the background/dielectric manifest built before anything
+  has touched netgen.occ), converted to netgen.occ lazily
+  (`_as_occ_solid`) only if a tie involving it is ever actually detected —
+  so this costs nothing for the common, unambiguous case. Closest-volume
+  is kept only as a fallback-of-a-fallback, for when containment itself
+  can't decide (an OCC Boolean failure — an established, handled risk
+  elsewhere in this file — or every tied entry's overlap coming back zero),
+  logging a `Palace: WARNING —` either way so a real ambiguity never
+  resolves silently on the weaker path. Read `_match_reference`'s own
+  docstring — it walks through why neither a floor nor a volume tiebreak
+  alone is enough — before touching this function again. Running
+  containment for every candidate against every reference unconditionally
+  (skipping the COM pre-filter entirely) was considered and rejected as
+  needless work for the ~95% of solids that are already unambiguous, and
+  it would scale worse on boards with many more solids than this one's 43.
+
+  `generate_mesh_netgen()` calls this same function at **two** points —
+  identifying each raw background (airbox/dielectric) solid straight off
+  the STEP re-import, and again for every post-`Glue()` solid once
+  conductors and ports are combined in — the first of these used to be a
+  second, separate, un-hardened nearest-COM loop with none of this
+  protection; a concentric dielectric shell (even with no conductor
+  involved at all) could have hit the identical bug there. Both call sites
+  now go through the one tested implementation.
 - **`_wave_port_boundary_edges` (the Netgen equivalent of `palace.meshing`'s
   `PortBoundaryCurves`) must NOT exclude conductor-adjacent edges.** It once
   did, by analogy with Gmsh's `cond_skip_planes` — but that analogy was
