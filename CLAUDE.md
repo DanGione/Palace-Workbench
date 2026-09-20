@@ -22,6 +22,7 @@ verified by running the container and exercising the GUI directly.
 | `palace/mesh_dispatch.py` | The one place that picks Gmsh vs. Netgen per `Simulation.MeshBackend` — every call site imports `generate_mesh` from here, never directly from `palace.meshing`/`palace.netgen_meshing` |
 | `palace/results_db.py` | xarray/NetCDF4 read/write; `append_sweep_point` concatenates sweep runs |
 | `palace/embedded_files.py` | Wraps `App::PropertyFileIncluded` so generated artifacts live inside the `.FCStd` |
+| `palace/shm_cleanup.py` | Pre-flight `/dev/shm` cleanup for orphaned Open MPI `vader_segment.*` files, called by `palace/runner.py` before every Palace launch — see the invariant below |
 | `docs/` | End-user markdown docs (rendered on GitHub) |
 | `tests/` | `pytest` coverage for `palace/`/`features/`, mirroring the source layout |
 
@@ -611,6 +612,60 @@ false-negative one. `commands/cmd_run.py`/`cmd_mesh.py`/`cmd_sweep.py`
 needed no changes at all — they only ever read `quality["is_bad"]` and pass
 the whole dict to `format_quality_warning()`, so only what causes the
 dialog to fire changed, not the dialog/blocking behavior itself.
+
+### `/dev/shm` cleanup for orphaned Open MPI `vader` segments — `palace/runner.py`, `palace/shm_cleanup.py`
+Open MPI's `vader` BTL (its shared-memory transport for intra-node inter-rank
+communication) creates one file per rank in `/dev/shm`, named
+`vader_segment.<hostname>.<uid>.<jobid>.<rank>`. These are removed on a
+clean exit but are **left behind** whenever a Palace/`mpirun` job crashes or
+is killed (`SIGKILL`, including via `CmdStopRun`'s `killpg`). Docker's
+default `/dev/shm` here is only 64MB (`--shm-size` intentionally left at
+that default, not changed, per explicit decision); on a real production
+document, several days of crashed/killed runs had left 34 orphaned files
+consuming 58MB/64MB (91% full, 6.3MB free), and Palace then crashed with
+`SIGBUS` (signal 7) during matrix assembly on a document with no actual
+mesh/config defect. Manually deleting all 34 files (after confirming via
+`ps`/`pgrep` that no `mpirun`/`palace-x86_64.bin` process was still running)
+brought usage to 0%, and the exact same simulation then ran to completion —
+confirming the cause. This is a **different** root cause than the SIGBUS
+documented under "Netgen meshing backend" above (malformed boundary
+attributes from a face-matching bug) — both happen to produce the identical
+`SIGBUS` signal during matrix assembly, so a future SIGBUS should not be
+assumed to be either one without checking `/dev/shm` usage as well as
+boundary-attribute sanity.
+
+`run_palace()` now calls `palace.shm_cleanup.cleanup_stale_shm_segments()`
+before every launch (once per pass, so a multi-port sweep is re-checked
+before each pass too, at no extra plumbing cost). Liveness is checked
+against real running processes — `/proc/<pid>/fd/*` **and**
+`/proc/<pid>/maps`, both — never file mtime alone, which is a racy proxy
+for "still in use." Both checks are required, not redundant: vader
+`mmap()`s the segment and typically closes the raw fd afterward, so `maps`
+is often the only signal that still shows the reference. **Must not**
+regress to an mtime-only or fd-only check — a currently-running, unrelated
+concurrent Palace simulation's own segments must never be deleted out from
+under it. Every removed and every kept (still-in-use) file is logged
+individually — **must not** go silent, since the failure mode this exists
+for (crash-induced buildup unnoticed for days) is precisely what silent
+cleanup would reproduce. After cleanup, `warn_if_shm_full()` (default
+threshold 80% — a single confirmed data point at 91%-used/crashed and
+0%-used/fixed, no finer-grained measurement exists, so treat this constant
+as a conservative extrapolation, not a validated boundary) logs a real
+`FreeCAD.Console.PrintWarning` if usage is still high even after removing
+everything safely removable — that can only mean a genuinely live
+concurrent job is using the space, so the message tells the user to wait
+or stop another simulation.
+
+`palace/shm_cleanup.py` has no FreeCAD/Qt dependency by design (pure
+`os`/`glob`/`shutil`), so its liveness/removal logic is fully unit-testable
+without mocking `/proc` — a test can `open()` (or `mmap()`) its own
+`tmp_path` file and the *test process itself* then legitimately shows up
+as a live referencer. `run_palace()` is the only place `mpirun`/the Palace
+binary is actually launched in this repo, so hooking only this one function
+is sufficient coverage, including for `commands/cmd_sweep.py`'s
+sweep/optimize runs (which reuse `cmd_run.py`'s
+`_build_passes`/`_launch_passes` → `_PassWorker` → `run_palace()`, the same
+path).
 
 ## Dependencies
 

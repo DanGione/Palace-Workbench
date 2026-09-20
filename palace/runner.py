@@ -19,6 +19,8 @@ import subprocess
 import sys
 import FreeCAD
 
+from palace.shm_cleanup import cleanup_stale_shm_segments, warn_if_shm_full
+
 
 def _is_wsl_path(path):
     """Return True if *path* looks like a Linux/WSL path (starts with /)."""
@@ -63,6 +65,27 @@ def run_palace(config_path, binary_path, num_procs=1, num_threads=0,
     """
     if not os.path.isfile(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    def _shm_log(msg):
+        text = msg if msg.endswith("\n") else msg + "\n"
+        FreeCAD.Console.PrintMessage(text)
+        if line_callback is not None:
+            line_callback(text)
+
+    def _shm_warn(msg):
+        text = msg if msg.endswith("\n") else msg + "\n"
+        FreeCAD.Console.PrintWarning(text)
+        if line_callback is not None:
+            line_callback(text)
+
+    # A crashed/killed MPI job leaves orphaned shared-memory segments behind
+    # in /dev/shm -- clean those up before every launch so they can't
+    # silently accumulate and starve a later run of shared memory (a real
+    # incident: see CLAUDE.md's "/dev/shm cleanup for orphaned Open MPI
+    # vader segments" invariant). No-ops harmlessly where /dev/shm doesn't
+    # exist (e.g. this process running natively on Windows for the WSL path).
+    cleanup_stale_shm_segments(log_fn=_shm_log)
+    warn_if_shm_full(log_fn=_shm_warn)
 
     on_windows = sys.platform == "win32"
     use_wsl = on_windows and _is_wsl_path(binary_path)
