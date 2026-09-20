@@ -302,13 +302,47 @@ def test_check_mesh_quality_flags_degenerate_mesh():
         gmsh.finalize()
 
 
+def test_check_mesh_quality_passes_when_bad_elements_are_a_negligible_sliver():
+    # The actual bug this volume-weighting fix addresses: a handful of
+    # below-threshold elements confined to a geometrically tiny feature (a
+    # thin shim sitting on an otherwise well-shaped block) used to flag the
+    # *entire* mesh bad on raw element count alone, even though the
+    # affected volume is negligible -- confirmed empirically across every
+    # example board in this repo (see CLAUDE.md's mesh-quality invariant).
+    gmsh = pytest.importorskip("gmsh")
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    try:
+        gmsh.model.add("test_quality_negligible_sliver")
+        gmsh.model.occ.addBox(0, 0, 0, 10, 10, 10)
+        # A thin shim sitting on top of the block -- same coarse-vs-thin
+        # mismatch as the degenerate-mesh test above, but confined to a
+        # feature whose own volume is a tiny fraction of the whole.
+        gmsh.model.occ.addBox(0, 0, 10, 1, 1, 0.01)
+        gmsh.model.occ.synchronize()
+        gmsh.option.setNumber("Mesh.MeshSizeMax", 2.0)
+        gmsh.model.mesh.generate(3)
+
+        messages = []
+        result = _check_mesh_quality(gmsh, messages.append, 0.1)
+
+        assert result["n_bad"] > 0  # the shim really does produce bad elements
+        assert result["bad_volume_fraction"] < 0.01
+        assert result["is_bad"] is False
+        assert any("quality check passed" in m for m in messages)
+    finally:
+        gmsh.finalize()
+
+
 def test_format_quality_warning_includes_counts_and_worst_value():
-    quality = {"n_bad": 3, "n_elements": 100, "min_quality": 0.0417}
+    quality = {"n_bad": 3, "n_elements": 100, "min_quality": 0.0417,
+               "bad_volume_fraction": 0.0002}
 
     msg = format_quality_warning(quality)
 
     assert "3/100" in msg
     assert "0.0417" in msg
+    assert "0.02%" in msg
 
 
 # ---------------------------------------------------------------------------

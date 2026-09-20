@@ -144,6 +144,8 @@ class CmdMesh:
                 from palace.embedded_files import embed
                 embed(mesh_obj, "MeshFile", mesh_path, "mesh.msh")
                 embed(mesh_obj, "GeometryFile", geometry_path, "geometry.step")
+                from features.mesh import store_mesh_quality
+                store_mesh_quality(mesh_obj, quality)
                 # embed() copies rather than consumes a source living in a
                 # subdirectory of the transient dir -- mesh_dir must be cleaned
                 # up explicitly or it leaks on every "Generate Mesh" click.

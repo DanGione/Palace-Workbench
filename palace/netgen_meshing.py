@@ -945,20 +945,48 @@ def _curved_tet_quality_batch(coords_all):
     return sj.min(axis=1)
 
 
-def _check_curved_mesh_quality(mesh, log_fn, threshold):
+def _tet_volume_batch(coords_all):
+    """coords_all: (N, 10, 3) (only the first 4 corners are used). Returns
+    (N,) straight-sided tet volume per element -- exact for the underlying
+    corners regardless of edge curvature, and cheap; a curved element's true
+    volume differs only by the (small, by construction) curvature correction,
+    which doesn't matter here since this is only ever used as a *weight* for
+    ranking how much of the mesh a quality defect affects, not a physical
+    quantity in its own right.
+    """
+    corners = coords_all[:, :4, :]
+    v0 = corners[:, 1] - corners[:, 0]
+    v1 = corners[:, 2] - corners[:, 0]
+    v2 = corners[:, 3] - corners[:, 0]
+    return np.abs(np.sum(v0 * np.cross(v1, v2), axis=1)) / 6.0
+
+
+def _check_curved_mesh_quality(mesh, log_fn, threshold,
+                                volume_fraction_threshold=0.01,
+                                inverted_volume_fraction_threshold=0.001):
     """Real curved-element quality gate -- see module note above. Matches
     _check_mesh_quality()'s exact dict contract so format_quality_warning()
     and every UI call site work unchanged regardless of backend.
+
+    is_bad is volume-weighted, not a raw element count -- see
+    palace.meshing._check_mesh_quality's docstring for the full reasoning
+    and the empirical data behind it (verified on both backends, this one
+    included: a real board's mesh with 18 genuinely inverted elements
+    confined to 0.0002% of its volume, and a smaller one with 2 inversions
+    at 0.011% of its volume that ran through an actual Palace solve to a
+    physically sane result with no crash).
     """
     if threshold <= 0.0:
         return {"min_quality": None, "n_elements": 0, "n_bad": 0,
-                "bad_fraction": 0.0, "is_bad": False}
+                "bad_fraction": 0.0, "bad_volume_fraction": 0.0,
+                "inverted_volume_fraction": 0.0, "is_bad": False}
 
     els = list(mesh.Elements3D())
     n = len(els)
     if n == 0:
         return {"min_quality": None, "n_elements": 0, "n_bad": 0,
-                "bad_fraction": 0.0, "is_bad": False}
+                "bad_fraction": 0.0, "bad_volume_fraction": 0.0,
+                "inverted_volume_fraction": 0.0, "is_bad": False}
 
     # Gather each element's 10 node coordinates, deduplicating shared nodes
     # via PointId.nr as a plain hashable key (MeshPoint objects from
@@ -980,26 +1008,38 @@ def _check_curved_mesh_quality(mesh, log_fn, threshold):
     coords_all = np.asarray(coords_list)[elem_ids]  # (N, 10, 3)
 
     quals = _curved_tet_quality_batch(coords_all)
+    vols = _tet_volume_batch(coords_all)
     min_quality = float(quals.min())
-    n_bad = int(np.count_nonzero(quals < threshold))
+    bad_mask = quals < threshold
+    inverted_mask = quals < 0.0
+    n_bad = int(np.count_nonzero(bad_mask))
+    total_vol = float(vols.sum())
+    bad_vol_frac = float(vols[bad_mask].sum() / total_vol) if total_vol > 0 else 0.0
+    inverted_vol_frac = float(vols[inverted_mask].sum() / total_vol) if total_vol > 0 else 0.0
 
     result = {
         "min_quality": min_quality,
         "n_elements": n,
         "n_bad": n_bad,
         "bad_fraction": n_bad / n,
-        "is_bad": n_bad > 0,
+        "bad_volume_fraction": bad_vol_frac,
+        "inverted_volume_fraction": inverted_vol_frac,
+        "is_bad": bool(bad_vol_frac > volume_fraction_threshold
+                       or inverted_vol_frac > inverted_volume_fraction_threshold),
     }
     if result["is_bad"]:
         log_fn(
             f"Palace: WARNING — mesh quality check found {n_bad}/{n} tetrahedra "
             f"below quality {threshold:.3g} (worst = {min_quality:.4g}, curved "
-            f"scaled-Jacobian). Degenerate/sliver elements can cause Palace "
-            f"solver instability or inaccurate results.\n"
+            f"scaled-Jacobian), {bad_vol_frac * 100:.3g}% of mesh volume "
+            f"({inverted_vol_frac * 100:.3g}% genuinely inverted). "
+            f"Degenerate/sliver elements can cause Palace solver instability or "
+            f"inaccurate results.\n"
         )
     else:
         log_fn(f"Palace: Mesh quality check passed ({n} tetrahedra, worst = "
-               f"{min_quality:.4g}).\n")
+               f"{min_quality:.4g}, {bad_vol_frac * 100:.3g}% of volume below "
+               f"threshold).\n")
     return result
 
 
@@ -1463,9 +1503,11 @@ def generate_mesh_netgen(doc, output_dir, log_fn=None):
     mesh.SecondOrder()
     mesh.Curve(2)
 
+    _vol_thresh, _inv_vol_thresh = _mesh_quality_volume_thresholds(doc)
     quality = _check_curved_mesh_quality(
         mesh, log_fn,
         _mesh_quality_threshold(doc),
+        _vol_thresh, _inv_vol_thresh,
     )
 
     # Wave ports' own outer boundary curve, PEC-tagged (attr 2, matching
@@ -1493,3 +1535,17 @@ def _mesh_quality_threshold(doc):
     from features import find_palace_mesh
     _mesh_obj = find_palace_mesh(doc)
     return getattr(_mesh_obj, "MeshQualityWarnThreshold", 0.1) if _mesh_obj else 0.1
+
+
+def _mesh_quality_volume_thresholds(doc):
+    """(volume_fraction_threshold, inverted_volume_fraction_threshold) -- the
+    two thresholds _check_curved_mesh_quality uses to turn per-element
+    quality/volume into is_bad. Same find_palace_mesh/getattr fallback
+    pattern as _mesh_quality_threshold, just for the two newer properties.
+    """
+    from features import find_palace_mesh
+    _mesh_obj = find_palace_mesh(doc)
+    if not _mesh_obj:
+        return 0.01, 0.001
+    return (getattr(_mesh_obj, "MeshQualityVolumeFraction", 0.01),
+            getattr(_mesh_obj, "MeshQualityInvertedVolumeFraction", 0.001))

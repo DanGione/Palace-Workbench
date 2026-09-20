@@ -571,6 +571,47 @@ grid to points that actually lie on the bounded face, via the same
 Falls back to the unfiltered grid if filtering would remove every point, so
 this can never produce fewer usable probes than before.
 
+### Mesh-quality `is_bad` is volume-weighted, not a raw element count — `palace/meshing.py`, `palace/netgen_meshing.py`
+Both backends classify tetrahedra as "bad" the same way — Gmsh's own
+`minSICN`, Netgen's curved scaled-Jacobian (`_curved_tet_quality_batch`),
+each below `MeshQualityWarnThreshold` (default 0.1) — but used to decide
+`is_bad = n_bad > 0`: **one** bad element out of any number flagged the
+*entire* mesh, feeding a blocking "Keep this mesh?"/"Run anyway?"
+`QMessageBox` (`cmd_mesh.py`, `cmd_run.py`) that defaults to **No**.
+Verified empirically to be a bad proxy for actual risk: mesh generation was
+run, both backends forced (not just each document's own default), against
+every example board in this repo plus a real in-progress board, capturing
+full per-element quality *and volume* — every one of them, including
+several with confirmed genuinely-inverted (negative-quality, not just
+low-but-valid) elements, showed volume-weighted badness under 0.5% (usually
+under 0.05%), while the old element-count fraction swung from under 0.01%
+to over 23% *on the same document* depending only on which backend meshed
+it — count doesn't just add noise, it doesn't even rank the two backends'
+actual mesh quality consistently. A real Palace solve (not just a mesh
+check) was run directly via `palace.runner.run_palace()` against a mesh
+with 2 confirmed inversions (0.011% of its volume): it completed cleanly
+and produced physically sane S-parameters, direct (not inferred)
+confirmation that a small-volume inversion neither crashes the solver nor
+corrupts the result.
+
+`is_bad` is now `bad_volume_fraction > MeshQualityVolumeFraction (default
+1%) or inverted_volume_fraction > MeshQualityInvertedVolumeFraction
+(default 0.1%)` — both new `PalaceMesh` properties (`features/mesh.py`,
+same "Refinement" group and `getattr(..., default)` fallback pattern as
+`MeshQualityWarnThreshold`). Genuine inversions (quality < 0) get their own
+stricter threshold since a folded/self-intersecting element is a
+qualitatively worse defect than a merely-thin one, even at equal volume.
+`n_bad`/`bad_fraction` (the old element-count stats) are kept in the
+returned dict for diagnostic/log context but no longer decide `is_bad` on
+their own. Confirmed the one synthetic case already proving the check can
+catch a *real* problem (`test_check_mesh_quality_flags_degenerate_mesh`, a
+deliberately 40x-too-coarse thin plate) is bad by volume too (100%, not
+just by count) — this fix doesn't trade a false-positive problem for a
+false-negative one. `commands/cmd_run.py`/`cmd_mesh.py`/`cmd_sweep.py`
+needed no changes at all — they only ever read `quality["is_bad"]` and pass
+the whole dict to `format_quality_warning()`, so only what causes the
+dialog to fire changed, not the dialog/blocking behavior itself.
+
 ## Dependencies
 
 - **Runtime:** `matplotlib`, `numpy`, `xarray`, `netCDF4`, `gmsh`, `netgen-mesher`

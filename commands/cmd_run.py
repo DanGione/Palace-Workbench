@@ -448,19 +448,21 @@ def _update_wave_port_impedances(doc, passes):
     return z0_data
 
 
-def _update_mesh_object(doc, mesh_path, geometry_path=None):
+def _update_mesh_object(doc, mesh_path, geometry_path=None, quality=None):
     """Update the PalaceMesh feature object and refresh its viewport display.
 
     Returns the PalaceMesh object so callers can re-point SimulationContainer.MeshFile
     at its resolved (embedded, permanent) MeshFile rather than the caller's scratch
     mesh_path -- the scratch source is typically rmtree'd right after this call.
     """
-    from features.mesh import create_palace_mesh
+    from features.mesh import create_palace_mesh, store_mesh_quality
     from palace.embedded_files import embed
     mesh_obj = create_palace_mesh(doc)
     embed(mesh_obj, "MeshFile", mesh_path, "mesh.msh")
     if geometry_path:
         embed(mesh_obj, "GeometryFile", geometry_path, "geometry.step")
+    if quality is not None:
+        store_mesh_quality(mesh_obj, quality)
     mesh_obj.Proxy.execute(mesh_obj)
     doc.recompute()
     return mesh_obj
@@ -1055,7 +1057,8 @@ class CmdRun:
                 mesh_elapsed = _fmt_elapsed(time.time() - t0_mesh)
                 sim.MeshFile = mesh_path
                 try:
-                    mesh_obj = _update_mesh_object(doc, mesh_path, geometry_path=geometry_path)
+                    mesh_obj = _update_mesh_object(doc, mesh_path, geometry_path=geometry_path,
+                                                   quality=quality)
                     # Re-point at the embedded (permanent) copy before deleting mesh_dir --
                     # generate_config() (called next, via _build_passes) reads sim.MeshFile
                     # to populate the Palace JSON config, so it must not still reference
