@@ -433,6 +433,51 @@ Four real, production-confirmed bugs fixed here that must not regress:
   the original annular-port centroid-mismatch case the scaled tolerance
   exists for, is in the function's own docstring — read it before touching
   this function again.
+
+  A fourth board (`Coax_to_Microstrip_wComponents.FCStd`, forced onto the
+  Netgen backend) showed the vertex-containment check above wasn't even
+  being reached: a **centroid**-to-face containment check ran first (same
+  scaled tolerance, capped at 0.5mm) and rejected a candidate whose area
+  matched the target exactly and whose *every vertex* sat exactly on the
+  target face (`distToShape` = 0.0 each) — about as strong a genuine-match
+  signal as geometry gets — because Netgen's own `Face.center` for this
+  particular shape lands 0.635mm from the true face, entirely in-plane
+  (its out-of-plane component was exact). That centroid-to-face check has
+  been removed outright: confirmed it was pure risk with no remaining
+  benefit — re-running the fix against the board the vertex-containment
+  check was originally added for produced byte-identical face-match counts
+  and mesh-quality numbers to before, so the vertex check alone was
+  already sufficient there too. The centroid-to-*plane* check earlier in
+  the same function (a different, coarser pre-filter) is unaffected and
+  stays.
+
+  A fifth case (`Coax_Directional_Bridge.FCStd` and `projects/Directional
+  Bridge.FCStd`, both via SMD-component impedance boundaries) found the
+  *flatness* check has the same class of problem the centroid checks did —
+  precision, not logic. It compares each vertex's distance from the
+  target's plane against `min_tol`, a small **fixed** value (0.05mm by
+  default) — and several SMD contact pads on these boards are themselves
+  exactly 0.05mm tall, so a genuinely perpendicular side-wall face (straddling
+  the target's plane from Z=0 to Z=0.05) had one vertex's computed distance
+  land at `0.049999999999999996` instead of the mathematically exact `0.05`
+  after a BREP roundtrip — just under the `>= min_tol` rejection by
+  floating-point noise alone. This matched 4 faces where 2 was correct
+  (confirmed the same mechanism explains a `10` vs. the correct `2` on
+  `projects/Directional Bridge.FCStd`, noted as unexplained earlier in this
+  same investigation), and fed Palace a boundary attribute spanning both an
+  interior and an exterior face — logged by Palace itself as "Found
+  boundary attribute with internal and external boundary elements" —
+  which crashed the solver outright (SIGBUS) during matrix assembly.
+  Fixed by adding `_approx_face_normal` (estimates a candidate's own
+  normal from its vertices via cross product, not any parametric surface
+  evaluation) and requiring it to be parallel, not perpendicular, to the
+  target's — confirmed on the real board to cleanly separate every case,
+  `|dot|` landing at `1.0` (to BREP precision) for every genuine match and
+  `0.0` for every perpendicular side wall, regardless of how the box's own
+  height happens to compare to `min_tol`. Skipped (not treated as a
+  rejection) when a normal can't be estimated at all (fewer than 3 distinct
+  vertices), so this can only reject an *additional* case beyond what the
+  flatness check already catches, never let one through.
 - **`_match_reference` needs a geometric-containment tiebreak for entries
   tied on center of mass**, not a volume-based heuristic. Solids that are
   coaxial and axially centered at the same point — a coax cable's center

@@ -401,6 +401,44 @@ def _face_plane(fc_face):
     return (n.x, n.y, n.z, n.x * com.x + n.y * com.y + n.z * com.z)
 
 
+def _approx_face_normal(verts):
+    """Unit normal of a planar candidate face, estimated from its own
+    vertices (cross product of the two longest independent edge vectors
+    from a common base point) rather than any parametric surface
+    evaluation -- avoids needing a valid (u,v) inside the face's actual
+    trimmed region, which .surf.Normal(u, v) requires and which isn't
+    known in advance for an arbitrary candidate.
+
+    Returns None if fewer than 3 distinct points are found (e.g. a face
+    bounded entirely by curves, with no straight-edge corners at all) --
+    callers must treat that as "orientation unknown", not "reject".
+    """
+    uniq = []
+    for v in verts:
+        p = (v.p[0], v.p[1], v.p[2])
+        if not any(abs(p[0] - q[0]) < 1e-9 and abs(p[1] - q[1]) < 1e-9
+                   and abs(p[2] - q[2]) < 1e-9 for q in uniq):
+            uniq.append(p)
+    if len(uniq) < 3:
+        return None
+    base = uniq[0]
+    best_mag_sq, best_n = -1.0, None
+    for i in range(1, len(uniq)):
+        for j in range(i + 1, len(uniq)):
+            e1 = tuple(uniq[i][k] - base[k] for k in range(3))
+            e2 = tuple(uniq[j][k] - base[k] for k in range(3))
+            cx = e1[1] * e2[2] - e1[2] * e2[1]
+            cy = e1[2] * e2[0] - e1[0] * e2[2]
+            cz = e1[0] * e2[1] - e1[1] * e2[0]
+            mag_sq = cx * cx + cy * cy + cz * cz
+            if mag_sq > best_mag_sq:
+                best_mag_sq, best_n = mag_sq, (cx, cy, cz)
+    if best_mag_sq < 1e-18:
+        return None  # every vertex collinear -- degenerate, can't tell
+    mag = best_mag_sq ** 0.5
+    return (best_n[0] / mag, best_n[1] / mag, best_n[2] / mag)
+
+
 def _match_occ_faces(candidate_faces, fc_face, min_tol=0.05):
     """Return the occ.Face objects among candidate_faces that are coplanar
     with and contained inside fc_face's boundary.
@@ -465,6 +503,60 @@ def _match_occ_faces(candidate_faces, fc_face, min_tol=0.05):
     (since 35 < 50) and the flatness check (it's genuinely coplanar) but
     still not a real sub-piece of fc_face. Every vertex of the candidate,
     not just its centroid, must also lie within fc_face's own boundary.
+
+    The centroid is not used for this containment check at all -- only the
+    candidate's own vertices are, via distToShape against fc_face itself.
+    An earlier version also required the centroid to be within `tol` of
+    fc_face before ever looking at the vertices, layered in front of the
+    vertex check above. That centroid requirement turned out to be pure
+    risk with no remaining benefit: confirmed on a second real board (a
+    coax-to-microstrip transition), a wave port's own dielectric target
+    face had a candidate whose area matched exactly and whose *every*
+    vertex sat exactly on the target face (distToShape = 0.0 for each) --
+    about as strong a genuine-match signal as geometry gets -- yet the
+    centroid check rejected it anyway, because Netgen's own Face.center for
+    this particular shape lands 0.635mm from the true face, entirely
+    in-plane (its out-of-plane component was exact), past even this
+    function's own scaled-tolerance cap. Removing the centroid-to-face
+    check and keeping everything else (area cap, centroid-to-*plane* check,
+    vertex flatness, vertex containment) produced the correct match on that
+    board, and produced byte-identical results on the board the vertex
+    check was originally added for -- confirming the centroid check was
+    never actually the deciding factor on either board, just an extra,
+    less reliable gate in front of a check that was already sufficient on
+    its own.
+
+    The flatness check has its own precision blind spot: it compares each
+    vertex's distance from the target's plane against `min_tol`, a small
+    *fixed* value (0.05mm by default) -- deliberately fixed, per the
+    reasoning above, so it isn't fooled by a large target's scaled `tol`.
+    But "fixed" also means it can coincide almost exactly with a real
+    feature's own size. Confirmed on a real board: several SMD components'
+    impedance-boundary target faces are the top of a 0.05mm-tall contact
+    pad -- exactly min_tol's own default -- and that pad's *side walls*
+    (a genuinely perpendicular face, straddling the target's plane from
+    Z=0 to Z=0.05) still matched: BREP export/reimport left one vertex's
+    computed distance at 0.049999999999999996 instead of the mathematically
+    exact 0.05, just under the `>= min_tol` rejection by floating-point
+    noise alone. This produced 4 matched faces where 2 was correct, and
+    fed a Palace run a boundary attribute spanning both a true exterior
+    face and an interior one -- logged by Palace itself as "Found boundary
+    attribute with internal and external boundary elements" -- which
+    crashed the solver outright (SIGBUS) during matrix assembly.
+
+    Fixed by adding an orientation check that doesn't depend on comparing
+    small distances near an arbitrary threshold at all: estimate the
+    candidate's own normal from its vertices (`_approx_face_normal`) and
+    require it to be parallel (not perpendicular) to the target's --
+    confirmed on the same board to cleanly separate every case, with
+    `|dot|` landing at 1.0 (to BREP precision) for every genuine match and
+    at 0.0 for every perpendicular side wall, no matter how the box's own
+    height happens to compare to min_tol. Skipped, not treated as a
+    rejection, when a normal can't be estimated (fewer than 3 distinct
+    vertices, or all of them collinear -- a face bounded entirely by
+    curves, no straight-edge corners to take a cross product from), so
+    this can only ever reject an additional case, never let through one
+    the flatness check would otherwise have caught.
     """
     import Part as FCPart
 
@@ -491,8 +583,15 @@ def _match_occ_faces(candidate_faces, fc_face, min_tol=0.05):
         if any(abs(nx * v.p[0] + ny * v.p[1] + nz * v.p[2] - plane_d) >= min_tol
                for v in verts):
             continue
-        dist, _, _ = fc_face.distToShape(FCPart.Vertex(FreeCAD.Vector(*c)))
-        if dist > tol:
+        # Belt-and-suspenders on top of the flatness check above: compare
+        # the candidate's own orientation, not just how close its vertices
+        # sit to the target's plane. Needed because "close to the plane"
+        # can itself be an unreliable signal at BREP-precision boundaries
+        # -- see _approx_face_normal's docstring for the real case that
+        # proved it. Skipped (not rejected) when a normal can't be
+        # estimated at all, e.g. a face with too few straight-edge corners.
+        cn = _approx_face_normal(verts)
+        if cn is not None and abs(cn[0] * nx + cn[1] * ny + cn[2] * nz) < 0.99:
             continue
         if any(fc_face.distToShape(FCPart.Vertex(FreeCAD.Vector(*v.p)))[0] > tol
                for v in verts):
