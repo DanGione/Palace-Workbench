@@ -111,6 +111,15 @@ class MeshPanel:
 
         root.addWidget(sizing)
 
+        # --- Generate button --- (placed right after sizing, not at the
+        # bottom of the panel, so it's obvious a meshing cycle can be
+        # started from here without scrolling past every status/settings
+        # group below)
+        self.btn_generate = QtWidgets.QPushButton("Generate Mesh")
+        self.btn_generate.setToolTip("Generate the mesh now (equivalent to the toolbar button)")
+        self.btn_generate.clicked.connect(self._generate)
+        root.addWidget(self.btn_generate)
+
         # --- Status group ---
         status = QtWidgets.QGroupBox("Mesh Status")
         sl = QtWidgets.QFormLayout(status)
@@ -127,6 +136,43 @@ class MeshPanel:
 
         root.addWidget(status)
 
+        # --- Quality group (read-only -- reports what the last generated
+        # mesh actually measured; MeshQualityWarnThreshold/VolumeFraction/
+        # InvertedVolumeFraction, editable via the property editor's
+        # "Refinement" group, are the settings that decide what counts as
+        # bad in the first place) ---
+        quality = QtWidgets.QGroupBox("Mesh Quality")
+        ql = QtWidgets.QFormLayout(quality)
+
+        self.lbl_quality_status = QtWidgets.QLabel("—")
+        ql.addRow("Status:", self.lbl_quality_status)
+
+        self.lbl_quality_worst = QtWidgets.QLabel("—")
+        ql.addRow("Worst element quality:", self.lbl_quality_worst)
+
+        self.lbl_quality_bad_volume = QtWidgets.QLabel("—")
+        self.lbl_quality_bad_volume.setToolTip(
+            "Fraction of total mesh volume occupied by elements below the "
+            "quality threshold -- what actually decides Status above."
+        )
+        ql.addRow("Bad volume:", self.lbl_quality_bad_volume)
+
+        self.lbl_quality_inverted_volume = QtWidgets.QLabel("—")
+        self.lbl_quality_inverted_volume.setToolTip(
+            "Fraction of total mesh volume occupied by genuinely inverted "
+            "(negative-quality) elements specifically."
+        )
+        ql.addRow("Inverted volume:", self.lbl_quality_inverted_volume)
+
+        self.lbl_quality_bad_count = QtWidgets.QLabel("—")
+        self.lbl_quality_bad_count.setToolTip(
+            "Below-threshold element count, for reference only -- a raw count "
+            "doesn't reflect actual risk, see Bad volume above."
+        )
+        ql.addRow("Bad elements (count):", self.lbl_quality_bad_count)
+
+        root.addWidget(quality)
+
         # --- Attribute visibility group ---
         vis = QtWidgets.QGroupBox("Visible Attributes")
         vl = QtWidgets.QVBoxLayout(vis)
@@ -135,12 +181,6 @@ class MeshPanel:
         self.attr_list.itemChanged.connect(self._on_attr_visibility_changed)
         vl.addWidget(self.attr_list)
         root.addWidget(vis)
-
-        # --- Generate button ---
-        self.btn_generate = QtWidgets.QPushButton("Generate Mesh")
-        self.btn_generate.setToolTip("Generate the mesh now (equivalent to the toolbar button)")
-        self.btn_generate.clicked.connect(self._generate)
-        root.addWidget(self.btn_generate)
 
         root.addStretch()
         return w
@@ -158,7 +198,39 @@ class MeshPanel:
         self.edit_port_size.setText("" if port_size == 0.0 else str(port_size))
         self.edit_refine_dist.setText("" if refine_dist == 0.0 else str(refine_dist))
         self._refresh_status()
+        self._refresh_quality()
         self._populate_attrs()
+
+    def _refresh_quality(self):
+        o = self.obj
+        if not getattr(o, "MeshQualityLastHasData", False):
+            for lbl in (self.lbl_quality_status, self.lbl_quality_worst,
+                        self.lbl_quality_bad_volume, self.lbl_quality_inverted_volume,
+                        self.lbl_quality_bad_count):
+                lbl.setText("—")
+                lbl.setStyleSheet("")
+            return
+
+        is_bad = getattr(o, "MeshQualityLastIsBad", False)
+        self.lbl_quality_status.setText("WARNING — low quality" if is_bad else "Passed")
+        self.lbl_quality_status.setStyleSheet(
+            "color: #b00020; font-weight: bold;" if is_bad else "color: #2e7d32;"
+        )
+
+        min_q = getattr(o, "MeshQualityLastMinQuality", 0.0)
+        kind = "inverted" if min_q < 0.0 else "degenerate" if min_q < 0.1 else "healthy"
+        self.lbl_quality_worst.setText(f"{min_q:.4g} ({kind})")
+
+        bad_vol_pct = getattr(o, "MeshQualityLastBadVolumeFraction", 0.0) * 100
+        self.lbl_quality_bad_volume.setText(f"{bad_vol_pct:.3g}% of mesh volume")
+
+        inv_vol_pct = getattr(o, "MeshQualityLastInvertedVolumeFraction", 0.0) * 100
+        self.lbl_quality_inverted_volume.setText(f"{inv_vol_pct:.3g}% of mesh volume")
+
+        n_bad = getattr(o, "MeshQualityLastNBad", 0)
+        n_elements = getattr(o, "MeshQualityLastNElements", 0)
+        bad_pct = getattr(o, "MeshQualityLastBadFraction", 0.0) * 100
+        self.lbl_quality_bad_count.setText(f"{n_bad:,} / {n_elements:,} ({bad_pct:.3g}%)")
 
     def _refresh_status(self):
         mesh_file = getattr(self.obj, "MeshFile", "")
