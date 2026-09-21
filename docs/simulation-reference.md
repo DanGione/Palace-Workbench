@@ -56,13 +56,16 @@ The `:cuda` image is built for a broad range of NVIDIA GPU generations
 solver) is not yet wired up — GPU runs use Palace's standard iterative
 solvers, just executed on the GPU.
 
-**With a single GPU, turn off "Run passes in parallel"** (Solver tab,
-Driven settings) for multi-port simulations. `docker-compose.cuda.yml`
-requests all available GPUs with no per-pass device pinning, so running
-several excited-port passes simultaneously means several Palace processes
-contend for the same GPU at once — this can be slower than serial execution
-or exhaust GPU memory, neither of which happens on CPU. This doesn't apply
-if your machine has one GPU per simultaneous pass.
+**Turn off "Run passes in parallel"** (Solver tab, Driven settings) for
+multi-port simulations with Device=GPU. `docker-compose.cuda.yml` requests
+all available GPUs with no per-pass device pinning, and each pass launches
+its own independent Palace/mpirun process — none of them are assigned to a
+particular GPU, so running several simultaneously means they all contend for
+whichever GPU each one defaults to, even on a machine with multiple GPUs.
+This can be slower than serial execution or exhaust GPU memory, neither of
+which happens on CPU. Robust multi-GPU support (assigning each pass its own
+GPU) is planned future work, not yet implemented — see the `TODO(GPU)`
+comments in `commands/cmd_run.py` and `docker-compose.cuda.yml`.
 
 ---
 

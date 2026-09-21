@@ -12,5 +12,16 @@ services:
         reservations:
           devices:
             - driver: nvidia
+              # TODO(GPU): count: all exposes every GPU on the host to the
+              # container, but nothing on the application side currently
+              # assigns different Palace passes to different GPUs (no
+              # per-pass CUDA_VISIBLE_DEVICES pinning in
+              # commands/cmd_run.py/palace/runner.py) -- so today, multiple
+              # simultaneous passes ("Run passes in parallel" + Device=GPU)
+              # will still contend for the same GPU regardless of how many
+              # are visible here. See the matching TODO(GPU) in
+              # commands/cmd_run.py and docs/simulation-reference.md's GPU
+              # section. Robust multi-GPU support (round-robin or explicit
+              # per-port GPU assignment) is future work, not yet implemented.
               count: all
               capabilities: [gpu]

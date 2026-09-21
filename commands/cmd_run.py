@@ -831,6 +831,15 @@ def _launch_passes(passes, needs_merge, console, sim, binary,
     Must be called on the main thread.  Sets CmdRun._coordinator.
     """
     parallel = bool(getattr(sim, "ParallelPasses", True)) if sim else True
+    # TODO(GPU): with Device=GPU, parallel passes each independently launch
+    # their own Palace/mpirun subprocess with no CUDA_VISIBLE_DEVICES pinning
+    # -- they all contend for the same GPU(s) regardless of how many are
+    # exposed to the container (docker-compose.cuda.yml's `count: all`), since
+    # nothing here assigns a distinct GPU per pass. See docs/simulation-
+    # reference.md's GPU section for the current workaround (disable "Run
+    # passes in parallel" on a single-GPU box). Robust multi-GPU support
+    # (e.g. round-robin CUDA_VISIBLE_DEVICES per worker, or explicit per-port
+    # GPU assignment) is future work, not yet implemented.
     n = len(passes)
 
     # Build per-pass tab labels
