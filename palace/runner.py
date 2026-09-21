@@ -14,12 +14,89 @@ WSL binary (Windows → WSL2):
     The Windows output directory is translated to a WSL path automatically
     via  wsl wslpath  so Palace can write results back to the Windows filesystem.
 """
+import json
 import os
 import subprocess
 import sys
 import FreeCAD
 
 from palace.shm_cleanup import cleanup_stale_shm_segments, warn_if_shm_full
+
+_CUDA_SENTINEL_NAME = "palace-cuda-enabled"
+# Fallback prefix when binary_path has no usable directory component (e.g. a
+# bare "palace" resolved via PATH) -- matches this project's Docker images,
+# which always install to CMAKE_INSTALL_PREFIX=/usr/local (see Dockerfile's
+# `touch /usr/local/share/palace-cuda-enabled`). Without this fallback,
+# os.path.dirname(os.path.dirname("palace")) is "", producing a bogus
+# CWD-relative sentinel path that can never be created correctly.
+_DEFAULT_INSTALL_PREFIX = "/usr/local"
+
+
+def _requested_device(config_path):
+    """Return the Solver.Device value ("CPU"/"GPU") from a Palace config JSON.
+
+    Defensively defaults to "CPU" on *any* read/parse problem -- including a
+    well-formed but unexpectedly-shaped JSON document (e.g. "Solver" not being
+    an object) -- since this is a best-effort read, not a validator.
+    """
+    try:
+        with open(config_path) as f:
+            data = json.load(f)
+        solver = data.get("Solver", {})
+        if not isinstance(solver, dict):
+            return "CPU"
+        return solver.get("Device", "CPU")
+    except (OSError, ValueError):
+        return "CPU"
+
+
+def _cuda_sentinel_path(binary_path):
+    """Path to the marker Dockerfile:PALACE_WITH_CUDA=ON touches at install time.
+
+    Derived relative to the binary's own install prefix (bin/palace -> ../share/...)
+    rather than hardcoded to /usr/local, so this still works if the image's
+    CMAKE_INSTALL_PREFIX ever changes -- falling back to _DEFAULT_INSTALL_PREFIX
+    when binary_path has no directory component to derive a prefix from.
+    """
+    prefix = os.path.dirname(os.path.dirname(binary_path))
+    if not prefix:
+        prefix = _DEFAULT_INSTALL_PREFIX
+    return os.path.join(prefix, "share", _CUDA_SENTINEL_NAME)
+
+
+def _check_gpu_requested(config_path, binary_path, path_exists=os.path.isfile):
+    """Fail fast with a clear error if Device=GPU is requested but this Palace
+    build has no known CUDA support, instead of letting Palace itself fail deep
+    inside matrix assembly with a confusing, hard-to-diagnose error.
+
+    path_exists is injectable so the WSL launch path can check the sentinel
+    inside the WSL filesystem (via `wsl test -f`) instead of the default
+    os.path.isfile, which can't see into WSL from a native Windows process.
+    """
+    if _requested_device(config_path) != "GPU":
+        return
+    sentinel = _cuda_sentinel_path(binary_path)
+    if path_exists(sentinel):
+        return
+    raise RuntimeError(
+        "This simulation requests Device=GPU, but this Palace installation has "
+        f"no CUDA marker at {sentinel}.\n"
+        "If you're using this project's Docker images, switch to the :cuda "
+        "image variant (see docker-compose.cuda.yml).\n"
+        "If you built Palace yourself with -DPALACE_WITH_CUDA=ON outside "
+        f"Docker, create an empty file at {sentinel} to confirm CUDA support "
+        "and silence this check."
+    )
+
+
+def _wsl_path_exists(path):
+    """Check for a file inside the WSL filesystem from native Windows Python.
+
+    Mirrors the existing _win_to_wsl() pattern below (shelling into `wsl`) --
+    a plain os.path.isfile() on a WSL-style "/..." path can't see it.
+    """
+    result = subprocess.run(["wsl", "test", "-f", path], capture_output=True)
+    return result.returncode == 0
 
 
 def _is_wsl_path(path):
@@ -100,6 +177,11 @@ def run_palace(config_path, binary_path, num_procs=1, num_threads=0,
         palace_args += ["--nt", str(num_threads)]
 
     if use_wsl:
+        # Check the sentinel inside the WSL filesystem (not via os.path.isfile,
+        # which can't see it from this native Windows process) before doing
+        # anything else on this path.
+        _check_gpu_requested(config_path, binary_path, path_exists=_wsl_path_exists)
+
         # Translate the Windows output directory to a WSL-accessible path
         wsl_config = _win_to_wsl(config_path)
         wsl_cwd    = _win_to_wsl(os.path.dirname(config_path))
@@ -117,6 +199,11 @@ def run_palace(config_path, binary_path, num_procs=1, num_threads=0,
                 "     Linux path, e.g. /home/user/spack/opt/.../bin/palace\n"
                 "  2. Use Docker (run Palace manually after files are generated)."
             )
+        # Checked after the "no native Windows build" check above, not before:
+        # on Windows without WSL, that's the real problem, and a GPU-specific
+        # error here would be confusing/wrong for what's actually a "Palace
+        # doesn't run natively on Windows" situation.
+        _check_gpu_requested(config_path, binary_path)
         cmd = [binary_path] + palace_args + [config_path]
         cwd = os.path.dirname(config_path)
 

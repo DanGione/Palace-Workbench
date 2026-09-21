@@ -17,6 +17,8 @@ Double-click the **PalaceSimulation** object to open this panel. It has three ta
 | **Verbose** | Palace console verbosity: 0 = minimal, 1 = normal, 2 = debug. |
 | **MPI processes** | Number of parallel MPI ranks. On a 4-core machine, 2–4 is typical. More ranks reduces wall-clock time but increases memory. |
 | **OMP threads/rank** | OpenMP threads per MPI rank. 0 = let the system decide. If MPI processes × OMP threads exceeds your core count, you'll see diminishing returns. |
+| **Device** | `CPU` (default) or `GPU`. Requires the `:cuda` Docker image variant and an NVIDIA GPU — see [GPU (CUDA) acceleration](#gpu-cuda-acceleration) below. |
+| **Partial assembly order** | Order threshold below which Palace uses operator partial assembly. `0` = let Palace decide. For GPU runs, setting this below **FE order** is recommended for best performance. |
 | **Length scale L0 (m)** | Converts model units to metres. Use `1e-3` if your model is drawn in millimetres (the typical FreeCAD default). All frequency-independent lengths (Airbox size, port geometry) are multiplied by L0 internally. |
 | **Output directory** | Legacy field, no longer used — Palace's raw CSV/field output is written to a temporary scratch location and discarded once the results database is built and embedded in the `.FCStd`. Safe to leave at its default. |
 | **Palace binary** | Full path to the `palace` executable. Pre-configured in the Docker image. For native installs, point this to your compiled binary. |
@@ -30,6 +32,37 @@ Double-click the **PalaceSimulation** object to open this panel. It has three ta
 | **Min element size** | Global minimum element size. 0 = Gmsh chooses. Ignored when Backend is Netgen. |
 
 The element size fields duplicate the settings in the Mesh panel (see below) — the Simulation panel copy is provided for convenience; both control the same properties. **Backend** exists only here, not in the Mesh panel.
+
+### GPU (CUDA) acceleration
+
+Palace can run on an NVIDIA GPU instead of CPU. This requires two separate
+things to both be true:
+
+1. **The right Docker image.** The default `:latest`/`:dev` images build
+   Palace CPU-only. Use the `:cuda` image variant instead (currently built
+   manually, on request — see the project's release notes if it isn't
+   published yet) and launch it with `docker compose -f
+   docker-compose.cuda.yml up`, which requests GPU access from Docker.
+   This in turn requires the [NVIDIA Container
+   Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+   to be installed on the host so Docker can see the GPU at all.
+2. **Device set to GPU** on this panel (see the General tab table above).
+   Setting this without the `:cuda` image produces a clear error before
+   Palace even launches, rather than a confusing crash mid-solve — the
+   error tells you which image to switch to.
+
+The `:cuda` image is built for a broad range of NVIDIA GPU generations
+(Volta through Blackwell). cuDSS (NVIDIA's GPU-resident sparse direct
+solver) is not yet wired up — GPU runs use Palace's standard iterative
+solvers, just executed on the GPU.
+
+**With a single GPU, turn off "Run passes in parallel"** (Solver tab,
+Driven settings) for multi-port simulations. `docker-compose.cuda.yml`
+requests all available GPUs with no per-pass device pinning, so running
+several excited-port passes simultaneously means several Palace processes
+contend for the same GPU at once — this can be slower than serial execution
+or exhaust GPU memory, neither of which happens on CPU. This doesn't apply
+if your machine has one GPU per simultaneous pass.
 
 ---
 

@@ -21,6 +21,12 @@ simulations — all configured and launched from the FreeCAD GUI.
    The first run downloads a ~3 GB image (FreeCAD + Palace pre-compiled).
    Subsequent starts take a few seconds.
 
+   An NVIDIA GPU-accelerated variant is also available — see [Simulation
+   Reference → GPU (CUDA) acceleration](docs/simulation-reference.md#gpu-cuda-acceleration)
+   and use `docker-compose.cuda.yml` instead. It's substantially larger than
+   the CPU image (bundles the CUDA toolkit) and is currently built on
+   request rather than on every release — see that doc for current status.
+
 3. Open your browser to:
    ```
    http://localhost:6080/vnc.html?autoconnect=1&resize=scale

@@ -55,6 +55,7 @@ Double-click **PalaceSimulation**. Under the **General** tab, confirm:
 - **Palace binary** points to `/usr/local/bin/palace` (pre-set in the Docker image). If you are running natively you must set this path yourself.
 - **Length scale L0** is `0.001` (millimetres).
 - **Backend** (in the Mesh group) — `Gmsh` by default. See [Simulation Reference → Choosing a mesh backend](simulation-reference.md#choosing-a-mesh-backend) if you want to try `Netgen` instead; no changes needed for this walkthrough.
+- **Device** — `CPU` by default. See [Simulation Reference → GPU (CUDA) acceleration](simulation-reference.md#gpu-cuda-acceleration) if you have an NVIDIA GPU and the `:cuda` image; no changes needed for this walkthrough.
 
 Under the **Frequencies** tab:
 

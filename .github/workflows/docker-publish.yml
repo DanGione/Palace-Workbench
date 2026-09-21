@@ -7,6 +7,11 @@ on:
   pull_request:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      build_cuda:
+        description: "Also build and push the GPU (CUDA) image variant"
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -14,20 +19,20 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -35,7 +40,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -45,12 +50,91 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Explicit false to preserve pre-v7 publish behavior unchanged by
+          # this action-version bump — v7 defaults to emitting build
+          # provenance/attestation manifests, which older Docker clients
+          # pulling from GHCR may not handle the same way.
+          provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # GPU (CUDA) IMAGE — MANUAL TRIGGER ONLY, TEMPORARY.
+  # This is gated behind workflow_dispatch + build_cuda because it is not yet
+  # validated on real GPU hardware (CI runners have no GPU; only compiles,
+  # never runs). Once proven working against real NVIDIA hardware, REMOVE
+  # this gate and move this job onto the same push/tag triggers as
+  # build-and-push above, so the CUDA image builds automatically like the
+  # CPU image does.
+  #
+  # To dispatch: run this workflow manually with build_cuda checked, targeting
+  # the "main" branch/ref specifically — the raw `latest-cuda` tag (matching
+  # the CPU image's `latest` behavior) only gets produced when github.ref is
+  # refs/heads/main, same rule as the CPU job's own `latest` tag below.
+  # ============================================================================
+  build-and-push-cuda:
+    # Compared with `== 'true'` rather than used bare: workflow_dispatch
+    # boolean inputs triggered via the GitHub CLI/REST API (not the web UI
+    # form) can arrive as the literal string "false", which is truthy in a
+    # bare GitHub Actions expression — this comparison is correct for both a
+    # real boolean and a "true"/"false" string either way.
+    if: github.event_name == 'workflow_dispatch' && inputs.build_cuda == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=-cuda,onlatest=true
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push CUDA Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          build-args: |
+            BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu22.04
+            PALACE_WITH_CUDA=ON
+          cache-from: type=gha,scope=cuda
+          # mode=min (the default), not mode=max like the CPU job: this build
+          # compiles 8 CUDA architectures from a much larger -devel base, so a
+          # mode=max cache-to here would write a disproportionately large
+          # amount into the single, repo-wide 10 GB GHA cache (LRU-evicted,
+          # not a separate quota per scope=) — risking evicting the CPU job's
+          # cache even though the CPU job runs far more often (every push).
+          cache-to: type=gha,scope=cuda

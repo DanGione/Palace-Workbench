@@ -137,6 +137,26 @@ a sign of a meshing problem. If you'd rather not see it at all, set an
 **Integration edge** on the port (switches to Palace's native, more accurate
 impedance calculation and skips the probe grid entirely).
 
+**"This simulation requests Device=GPU, but this Palace installation has no CUDA marker"**
+
+**Device** is set to `GPU` on the Simulation panel's General tab, but the
+running Palace binary wasn't built with CUDA support. Most likely you're
+running the default `:latest`/`:dev` image (CPU-only) — switch to the
+`:cuda` image variant and launch it with `docker-compose.cuda.yml` instead.
+If you built Palace yourself outside Docker with `-DPALACE_WITH_CUDA=ON`,
+this check doesn't know about it yet; the error names the exact marker file
+path to create to confirm CUDA support and silence the check.
+
+**GPU run fails to start, or `nvidia-smi` isn't found inside the container**
+
+The `:cuda` image needs the host to have the [NVIDIA Container
+Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+installed so Docker can pass the GPU through — without it, the GPU
+reservation in `docker-compose.cuda.yml` silently has nothing to attach to.
+Verify with `docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04
+nvidia-smi` on the host before troubleshooting further inside this
+workbench's container.
+
 ---
 
 ## Results

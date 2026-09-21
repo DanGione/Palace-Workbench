@@ -181,6 +181,13 @@ def _build_boundaries(airbox, lumped_ports, wave_ports, conductor_groups,
 def _build_solver(sim):
     solver = {"Order": sim.Order}
 
+    device = getattr(sim, "Device", "CPU")
+    if device != "CPU":
+        solver["Device"] = device
+    partial_order = getattr(sim, "PartialAssemblyOrder", 0)
+    if partial_order > 0:
+        solver["PartialAssemblyOrder"] = partial_order
+
     if sim.SimulationType == "Driven":
         sweep_mode = getattr(sim, "DrivenSweepMode", "Linear")
         if sweep_mode == "Samples":

@@ -4,7 +4,7 @@ import pytest
 
 from features.simulation import create_simulation
 from features.wave_port import create_wave_port
-from palace.config import _build_boundaries, _probe_points_along_edge, generate_config
+from palace.config import _build_boundaries, _build_solver, _probe_points_along_edge, generate_config
 
 
 @pytest.fixture
@@ -108,3 +108,50 @@ def test_generate_config_skips_field_probes_for_voltage_path_port(doc):
     wp_entries = {e["Index"]: e for e in cfg["Boundaries"]["WavePort"]}
     assert "VoltagePath" in wp_entries[1]
     assert "VoltagePath" not in wp_entries[2]
+
+
+def test_solver_device_omitted_when_cpu(doc):
+    sim = create_simulation(doc)
+
+    solver = _build_solver(sim)
+
+    assert "Device" not in solver
+
+
+def test_solver_device_emitted_when_gpu(doc):
+    sim = create_simulation(doc)
+    sim.Device = "GPU"
+
+    solver = _build_solver(sim)
+
+    assert solver["Device"] == "GPU"
+
+
+def test_solver_partial_assembly_order_omitted_at_zero(doc):
+    sim = create_simulation(doc)
+
+    solver = _build_solver(sim)
+
+    assert "PartialAssemblyOrder" not in solver
+
+
+def test_solver_partial_assembly_order_emitted_when_nonzero(doc):
+    sim = create_simulation(doc)
+    sim.PartialAssemblyOrder = 1
+
+    solver = _build_solver(sim)
+
+    assert solver["PartialAssemblyOrder"] == 1
+
+
+def test_solver_partial_assembly_order_omitted_when_negative(doc):
+    # PartialAssemblyOrder is a plain App::PropertyInteger with no Constraints
+    # (the GUI spinbox clamps to [0,4], but a macro/scripted caller isn't
+    # bound by that) -- a negative value has no defined meaning to Palace and
+    # must be omitted like any other unset value, not forwarded as-is.
+    sim = create_simulation(doc)
+    sim.PartialAssemblyOrder = -1
+
+    solver = _build_solver(sim)
+
+    assert "PartialAssemblyOrder" not in solver

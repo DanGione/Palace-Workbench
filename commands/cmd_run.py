@@ -138,60 +138,71 @@ class _PassWorker(QThread):
         def _store_proc(p):
             self._proc = p
 
-        expected = _expected_freq_count(self._config_path)
+        try:
+            expected = _expected_freq_count(self._config_path)
 
-        for attempt in range(2):
-            rc = run_palace(
-                self._config_path, self._binary,
-                num_procs=self._num_procs,
-                num_threads=self._num_threads,
-                line_callback=self.log.emit,
-                proc_callback=_store_proc,
-            )
-            self._proc = None
-
-            if self._cancelled:
-                self.log.emit("Palace: *** SIMULATION ABORTED — process killed ***\n")
-                self.pass_done.emit(self._pass_index, False, "Simulation cancelled by user")
-                return
-
-            if rc != 0:
-                self.pass_done.emit(
-                    self._pass_index, False, f"Palace exited with code {rc}"
+            for attempt in range(2):
+                rc = run_palace(
+                    self._config_path, self._binary,
+                    num_procs=self._num_procs,
+                    num_threads=self._num_threads,
+                    line_callback=self.log.emit,
+                    proc_callback=_store_proc,
                 )
-                return
+                self._proc = None
 
-            if expected is None:
-                break  # non-Driven or complex sweep — skip frequency check
+                if self._cancelled:
+                    self.log.emit("Palace: *** SIMULATION ABORTED — process killed ***\n")
+                    self.pass_done.emit(self._pass_index, False, "Simulation cancelled by user")
+                    return
 
-            out_csv = os.path.join(self._pass_dir, "port-S.csv")
-            n_rows  = _read_freq_count(out_csv)
-
-            if n_rows is None:
-                msg = "port-S.csv not found or unreadable"
-                if attempt == 0:
-                    self.log.emit(f"Palace: Warning: {msg} — retrying…\n")
-                    continue
-                self.pass_done.emit(
-                    self._pass_index, False,
-                    f"Frequency check failed: {msg} (after retry)"
-                )
-                return
-
-            if n_rows != expected:
-                msg = f"got {n_rows} frequency points, expected {expected}"
-                if attempt == 0:
-                    self.log.emit(
-                        f"Palace: Warning: frequency count mismatch — {msg}. Retrying…\n"
+                if rc != 0:
+                    self.pass_done.emit(
+                        self._pass_index, False, f"Palace exited with code {rc}"
                     )
-                    continue
-                self.pass_done.emit(
-                    self._pass_index, False,
-                    f"Frequency count mismatch: {msg} (after retry)"
-                )
-                return
+                    return
 
-            break  # all checks passed
+                if expected is None:
+                    break  # non-Driven or complex sweep — skip frequency check
+
+                out_csv = os.path.join(self._pass_dir, "port-S.csv")
+                n_rows  = _read_freq_count(out_csv)
+
+                if n_rows is None:
+                    msg = "port-S.csv not found or unreadable"
+                    if attempt == 0:
+                        self.log.emit(f"Palace: Warning: {msg} — retrying…\n")
+                        continue
+                    self.pass_done.emit(
+                        self._pass_index, False,
+                        f"Frequency check failed: {msg} (after retry)"
+                    )
+                    return
+
+                if n_rows != expected:
+                    msg = f"got {n_rows} frequency points, expected {expected}"
+                    if attempt == 0:
+                        self.log.emit(
+                            f"Palace: Warning: frequency count mismatch — {msg}. Retrying…\n"
+                        )
+                        continue
+                    self.pass_done.emit(
+                        self._pass_index, False,
+                        f"Frequency count mismatch: {msg} (after retry)"
+                    )
+                    return
+
+                break  # all checks passed
+        except Exception as exc:
+            # run_palace() can raise synchronously before Palace even launches
+            # (e.g. FileNotFoundError for a missing config, or the GPU-capability
+            # RuntimeError from palace/runner.py's _check_gpu_requested). Without
+            # this, pass_done never fires, _SimCoordinator never reaches
+            # all_done, and the UI hangs on "Running Palace..." forever with no
+            # error shown and the Stop button greyed out.
+            self.log.emit(f"Palace: ERROR: {exc}\n")
+            self.pass_done.emit(self._pass_index, False, str(exc))
+            return
 
         self.pass_done.emit(self._pass_index, True, "OK")
 

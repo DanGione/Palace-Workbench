@@ -100,6 +100,14 @@ class SimulationContainer:
         _add(obj, "App::PropertyBool", "ParallelPasses", "Solver",
              "Run multi-port excitation passes simultaneously (parallel) rather than one at a time (serial)",
              True)
+        _add(obj, "App::PropertyEnumeration", "Device", "Solver",
+             "Compute device Palace uses to run this simulation. GPU requires the :cuda "
+             "Docker image variant.")
+        if hasattr(obj, "Device"):
+            obj.Device = ["CPU", "GPU"]
+        _add(obj, "App::PropertyInteger", "PartialAssemblyOrder", "Solver",
+             "Order threshold below which Palace uses operator partial assembly "
+             "(0 = let Palace decide; recommended below Order for GPU runs)", 0)
 
         # Eigenmode
         _add(obj, "App::PropertyInteger", "EigenNumModes", "Eigenmode Solver",

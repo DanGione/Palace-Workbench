@@ -1,4 +1,5 @@
-FROM ubuntu:22.04
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC \
@@ -55,13 +56,45 @@ RUN pip install --no-cache-dir gmsh netgen-mesher numpy scipy cmake matplotlib x
 # Pinned to v0.17.0 (latest tagged release as of writing) instead of tracking
 # main — an unpinned clone silently picks up whatever's newest upstream on
 # every image rebuild, making builds non-reproducible and liable to break.
+#
+# PALACE_WITH_CUDA/PALACE_CUDA_ARCHITECTURES: OFF/unused by default. With
+# PALACE_WITH_CUDA=OFF the extra -D flags below are inert (PALACE_WITH_CUDA
+# is a plain `OFF CACHE BOOL` in Palace's own CMakeLists.txt, confirmed at
+# the v0.17.0 tag; CMAKE_CUDA_ARCHITECTURES is a no-op unless something
+# enable_language(CUDA)s, which is itself gated behind PALACE_WITH_CUDA) —
+# functionally the same CPU-only build as before this file was parameterized,
+# though this has only been confirmed by reading Palace's CMakeLists, not by
+# diffing an actual before/after build. Set PALACE_WITH_CUDA=ON with
+# BASE_IMAGE=nvidia/cuda:...-devel-... to build the GPU variant (see
+# docker-publish.yml's build-and-push-cuda job).
+# TODO(GPU): this bakes the CUDA compiler/devel toolkit into the final image
+# because Palace is built and installed in the same stage it's used from.
+# Once the CUDA path is proven on real hardware, switch to a multi-stage
+# build (compile in a `-devel` stage, copy the installed artifacts into a
+# `-runtime` final stage) to drop several GB of compiler/headers nothing at
+# runtime needs.
+ARG PALACE_WITH_CUDA=OFF
+# Volta(70) Turing(75) Ampere(80,86) Ada(89) Hopper(90) Blackwell(100,120) —
+# broad default so the published image works across GPU generations without
+# knowing the pulling user's exact card; narrow this for a faster local/dev
+# build targeting just your own GPU's compute capability.
+ARG PALACE_CUDA_ARCHITECTURES=70;75;80;86;89;90;100;120
 RUN git clone --depth=1 --branch v0.17.0 https://github.com/awslabs/palace.git /tmp/palace-src \
     && cmake -S /tmp/palace-src -B /tmp/palace-src/build \
              -DCMAKE_BUILD_TYPE=Release \
              -DCMAKE_INSTALL_PREFIX=/usr/local \
+             -DPALACE_WITH_CUDA=${PALACE_WITH_CUDA} \
+             -DCMAKE_CUDA_ARCHITECTURES="${PALACE_CUDA_ARCHITECTURES}" \
     && cmake --build /tmp/palace-src/build -j$(nproc) \
     && cmake --install /tmp/palace-src/build \
-    && rm -rf /tmp/palace-src
+    && rm -rf /tmp/palace-src \
+    && if [ "${PALACE_WITH_CUDA}" = "ON" ]; then \
+         mkdir -p /usr/local/share \
+         && touch /usr/local/share/palace-cuda-enabled; \
+       fi
+# The filename above (palace-cuda-enabled) must match _CUDA_SENTINEL_NAME in
+# palace/runner.py exactly -- nothing enforces this beyond this comment pair,
+# so grep both locations before renaming/relocating either one.
 
 # ── Non-root user ─────────────────────────────────────────────────────────────
 ARG USERNAME=vscode

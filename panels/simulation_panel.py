@@ -9,6 +9,7 @@ except ImportError:
 
 _SIM_TYPES = ["Driven", "Eigenmode", "Electrostatic"]
 _MESH_BACKENDS = ["Gmsh", "Netgen"]
+_DEVICES = ["CPU", "GPU"]
 
 # Column indices for the samples table
 _COL_TYPE  = 0
@@ -76,6 +77,22 @@ class SimulationPanel:
             "OpenMP threads per MPI rank (OMP_NUM_THREADS). 0 = use system default."
         )
         fl.addRow("OMP threads/rank:", self.spin_num_threads)
+
+        self.combo_device = QtWidgets.QComboBox()
+        self.combo_device.addItems(_DEVICES)
+        self.combo_device.setToolTip(
+            "Compute device Palace uses to run this simulation.\n"
+            "GPU requires the :cuda Docker image variant and an NVIDIA GPU."
+        )
+        fl.addRow("Device:", self.combo_device)
+
+        self.spin_partial_assembly = QtWidgets.QSpinBox()
+        self.spin_partial_assembly.setRange(0, 4)
+        self.spin_partial_assembly.setToolTip(
+            "Order threshold below which Palace uses operator partial assembly.\n"
+            "0 = let Palace decide. Recommended below FE order for GPU runs."
+        )
+        fl.addRow("Partial assembly order:", self.spin_partial_assembly)
 
         self.edit_l0 = QtWidgets.QLineEdit()
         self.edit_l0.setToolTip("Length scale in meters, e.g. 1e-3 for mm")
@@ -438,6 +455,11 @@ class SimulationPanel:
         self.spin_verbose.setValue(o.Verbose)
         self.spin_num_procs.setValue(getattr(o, "NumProcesses", 1))
         self.spin_num_threads.setValue(getattr(o, "NumThreads", 0))
+        device = getattr(o, "Device", "CPU")
+        self.combo_device.setCurrentIndex(
+            _DEVICES.index(device) if device in _DEVICES else 0
+        )
+        self.spin_partial_assembly.setValue(getattr(o, "PartialAssemblyOrder", 0))
         self.edit_l0.setText(str(o.L0))
         self.edit_output.setText(o.OutputDir)
         self.edit_binary.setText(o.PalaceBinary)
@@ -506,6 +528,8 @@ class SimulationPanel:
         o.Verbose        = self.spin_verbose.value()
         o.NumProcesses   = self.spin_num_procs.value()
         o.NumThreads     = self.spin_num_threads.value()
+        o.Device         = _DEVICES[self.combo_device.currentIndex()]
+        o.PartialAssemblyOrder = self.spin_partial_assembly.value()
         o.L0             = self._float(self.edit_l0, o.L0)
         o.OutputDir      = self.edit_output.text()
         o.PalaceBinary   = self.edit_binary.text()
