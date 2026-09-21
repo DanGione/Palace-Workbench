@@ -275,12 +275,52 @@ class PalaceMesh:
              "Distance (mm) over which refinement transitions to global cl_max. "
              "0 = auto (30% of model extent).", 0.0)
         _add(obj, "App::PropertyFloat", "MeshQualityWarnThreshold", "Refinement",
-             "Minimum acceptable tetrahedron quality (Gmsh minSICN, 0-1) before the "
-             "post-mesh quality check warns. 0 = disabled.", 0.1)
+             "Minimum acceptable tetrahedron quality (Gmsh minSICN, or Netgen's "
+             "curved scaled-Jacobian, 0-1) before an element counts as bad. "
+             "0 = disabled.", 0.1)
+        _add(obj, "App::PropertyFloat", "MeshQualityVolumeFraction", "Refinement",
+             "Fraction of total mesh volume occupied by below-threshold elements "
+             "before the post-mesh quality check warns (0-1). A raw element count "
+             "doesn't reflect actual risk -- a handful of tiny slivers in an "
+             "otherwise-healthy mesh of thousands is normal, not a problem.", 0.01)
+        _add(obj, "App::PropertyFloat", "MeshQualityInvertedVolumeFraction", "Refinement",
+             "Fraction of total mesh volume occupied by genuinely inverted "
+             "(negative-quality) elements before the post-mesh quality check warns "
+             "(0-1). Stricter than MeshQualityVolumeFraction since a folded element "
+             "is a qualitatively worse defect than a merely thin one.", 0.001)
         _add(obj, "App::PropertyIntegerList", "HiddenSurfAttributes", "Mesh",
              "Surface physical-group attribute numbers hidden from the 3D view", [])
         _add(obj, "App::PropertyIntegerList", "HiddenVolAttributes", "Mesh",
              "Volume physical-group attribute numbers hidden from the 3D view", [])
+        # Results of the *last* quality check actually run against this mesh
+        # (see store_mesh_quality below) -- distinct from the
+        # MeshQualityWarnThreshold/MeshQualityVolumeFraction/
+        # MeshQualityInvertedVolumeFraction settings above, which only say
+        # what *would* count as bad, not what the current mesh actually
+        # measured. MeshQualityLastHasData distinguishes "never checked yet"
+        # (or the check was threshold-disabled) from "checked, and it's
+        # genuinely all zeros" -- the other fields can't tell those apart on
+        # their own since 0.0 is a valid real value for all of them.
+        _add(obj, "App::PropertyBool", "MeshQualityLastHasData", "Mesh Quality",
+             "Whether the fields below reflect a real quality check result.", False)
+        _add(obj, "App::PropertyFloat", "MeshQualityLastMinQuality", "Mesh Quality",
+             "Worst per-element quality value found (same scale as "
+             "MeshQualityWarnThreshold).", 0.0)
+        _add(obj, "App::PropertyInteger", "MeshQualityLastNElements", "Mesh Quality",
+             "Total tetrahedra in the last generated mesh.", 0)
+        _add(obj, "App::PropertyInteger", "MeshQualityLastNBad", "Mesh Quality",
+             "Tetrahedra below MeshQualityWarnThreshold in the last generated mesh.", 0)
+        _add(obj, "App::PropertyFloat", "MeshQualityLastBadFraction", "Mesh Quality",
+             "Fraction of tetrahedra (by count) below threshold -- kept for reference; "
+             "no longer what decides MeshQualityLastIsBad, see the *VolumeFraction fields.", 0.0)
+        _add(obj, "App::PropertyFloat", "MeshQualityLastBadVolumeFraction", "Mesh Quality",
+             "Fraction of total mesh volume occupied by below-threshold elements.", 0.0)
+        _add(obj, "App::PropertyFloat", "MeshQualityLastInvertedVolumeFraction", "Mesh Quality",
+             "Fraction of total mesh volume occupied by genuinely inverted "
+             "(negative-quality) elements.", 0.0)
+        _add(obj, "App::PropertyBool", "MeshQualityLastIsBad", "Mesh Quality",
+             "Whether the last quality check warned (volume-weighted, see "
+             "palace.meshing._check_mesh_quality).", False)
         # Internal bookkeeping only -- lets execute() tell "a new mesh was just
         # embedded" apart from "recompute reran for an unrelated reason" (see
         # execute()). A plain in-memory Proxy attribute can't do this: it must
@@ -580,3 +620,28 @@ def create_palace_mesh(doc):
     add_to_simulation(doc, obj)
     doc.recompute()
     return obj
+
+
+def store_mesh_quality(mesh_obj, quality):
+    """Persist a generate_mesh()/generate_mesh_netgen() quality dict onto
+    the PalaceMesh object, so the task panel (and the property editor) can
+    show the *actual measured* result for the mesh currently in the
+    document -- not just the threshold settings that decide what counts as
+    bad. Called from every place that generates a mesh (commands/cmd_mesh.py,
+    commands/cmd_run.py's _update_mesh_object, used in turn by
+    commands/cmd_sweep.py) right alongside embedding the mesh file itself.
+
+    A falsy/empty quality (shouldn't normally happen -- generate_mesh always
+    returns a dict, even the threshold-disabled case) is a no-op rather than
+    wiping out a previously-stored real result with placeholders.
+    """
+    if not quality:
+        return
+    mesh_obj.MeshQualityLastHasData = quality.get("min_quality") is not None
+    mesh_obj.MeshQualityLastMinQuality = quality.get("min_quality") or 0.0
+    mesh_obj.MeshQualityLastNElements = quality.get("n_elements", 0)
+    mesh_obj.MeshQualityLastNBad = quality.get("n_bad", 0)
+    mesh_obj.MeshQualityLastBadFraction = quality.get("bad_fraction", 0.0)
+    mesh_obj.MeshQualityLastBadVolumeFraction = quality.get("bad_volume_fraction", 0.0)
+    mesh_obj.MeshQualityLastInvertedVolumeFraction = quality.get("inverted_volume_fraction", 0.0)
+    mesh_obj.MeshQualityLastIsBad = bool(quality.get("is_bad", False))

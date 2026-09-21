@@ -162,8 +162,36 @@ def _dist_sq(a, b):
     return sum((x - y) ** 2 for x, y in zip(a, b))
 
 
-def _match_reference(com, reference):
-    """Nearest-COM match against a (label, com, kind, attr) reference list.
+def _as_occ_solid(geom):
+    """Return geom as a netgen.occ shape, converting a FreeCAD Part.Shape
+    via a one-time BREP roundtrip if it isn't already one.
+
+    Reference entries built before any conductor/port import (background
+    dielectrics/airbox -- see _match_reference's first call site) only have
+    a FreeCAD Part.Shape on hand at that point, since nothing has gone
+    through netgen.occ yet. Conversion is deferred to here, called only
+    when a genuine COM tie needs geometric containment to resolve, so it
+    never costs anything for the common, unambiguous case.
+    """
+    if not hasattr(geom, "exportBrep"):
+        return geom  # already netgen.occ -- conductor and re-identified
+                     # background entries are native from construction.
+    occ, _ngm = _netgen()
+    brep_path = tempfile.mktemp(suffix=".brep")
+    try:
+        geom.exportBrep(brep_path)
+        return occ.OCCGeometry(brep_path).shape
+    finally:
+        try:
+            os.unlink(brep_path)
+        except OSError:
+            pass
+
+
+def _match_reference(candidate, reference, log_fn=None):
+    """Nearest-COM match against a (label, com, kind, attr, volume, geom)
+    reference list, with a geometric-containment tiebreak for entries that
+    are equally close (a coaxial/concentric case COM alone cannot resolve).
 
     Netgen's Glue() does not reliably propagate .name through *nested*
     containment (airbox containing dielectric containing conductor -- this
@@ -171,13 +199,100 @@ def _match_reference(com, reference):
     touching or disjoint solids -- verified with a minimal repro. COM
     matching is the same technique palace.meshing._match_vol_by_com already
     uses on the Gmsh side, and is what actually works here.
+
+    COM alone is not enough, though: solids that are coaxial and axially
+    centered at the same point -- a coax cable's center pin, its
+    surrounding annular dielectric spacer, and its outer shield tube, when
+    the spacer and shield happen to be the same length -- all share the
+    same center of mass, and "nearest COM" cannot rank entries that are
+    exactly (or near-exactly) tied. Confirmed on a real board, in two
+    different ways from what looks like the same underlying ambiguity:
+    first the whole PTFE spacer (volume 47.6) matched the coax pin's own
+    conductor reference (volume 6.2), then -- after restricting candidates
+    to ones large enough to actually contain the fragment -- the outer
+    shield tube (volume 41.2, smaller than the spacer's 47.6, so it still
+    passed that restriction) matched the *spacer's* reference instead of
+    its own. A volume floor alone cannot fix this -- it only rules out
+    references too small to be a match, and multiple references can still
+    be "big enough" while only one is actually correct -- and even a
+    closest-volume tiebreak is still just a heuristic: an asymmetrically
+    fragmented concentric layer could in principle have its reduced volume
+    land closer to some other tied entry's full volume than to its own.
+
+    The real, decisive test is geometric containment, not a volume
+    estimate: does the candidate solid actually sit inside a tied
+    reference's own original geometry? Confirmed empirically (synthetic
+    coaxial pin/spacer/shield-tube geometry matching this real case)
+    that netgen.occ's own `*` (Boolean intersection) operator answers this
+    cleanly with no extra roundtrip needed between two already-netgen.occ
+    shapes: a candidate intersected with its true parent returns its own
+    full volume; intersected with a *touching* but different material --
+    exactly the adjacency concentric layers have with each other -- returns
+    exactly 0.0, not some noisy near-zero value. So: rank by COM distance
+    first, same as always (cheap, and correct for the vast majority of
+    solids that aren't part of any such ambiguity). Only when two or more
+    entries are tied to within `tie_tol` (BREP/COM roundoff, not a real
+    physical separation -- genuinely different materials essentially never
+    coincide this tightly by accident) is the expensive check even run, and
+    then only among the tied entries: convert each tied entry's `geom` to a
+    netgen.occ shape if it isn't one already (`_as_occ_solid`), intersect
+    with the candidate, and pick whichever gives the largest overlap.
+
+    OCC Booleans can fail on pathological geometry (an established, handled
+    risk elsewhere in this file -- see _fuse_group_solids). If the
+    containment check raises, or every tied entry's overlap comes back
+    zero (inconclusive -- e.g. a genuinely-touching-only situation this
+    function was never meant to adjudicate), this falls back to the
+    original closest-volume heuristic among the tied entries, logging a
+    warning via `log_fn` either way so a real ambiguity doesn't resolve
+    silently on the weaker fallback. This never raises and never returns
+    None.
+
+    Used at two call sites, both prone to the exact same ambiguity: once to
+    identify each background (airbox/dielectric) solid straight off the
+    STEP re-import, before any conductor enters the picture (a dielectric
+    shell concentric with the airbox itself, or with another dielectric,
+    would hit this here even with no conductor at all), and again for every
+    solid Glue() produces once conductors, ports, and integration edges are
+    all combined in. One implementation, reused, rather than a second
+    hand-rolled nearest-COM loop with a weaker guarantee.
     """
-    best, best_d = None, float("inf")
-    for entry in reference:
-        d = _dist_sq(com, entry[1])
-        if d < best_d:
-            best_d, best = d, entry
-    return best
+    if log_fn is None:
+        log_fn = lambda msg: None
+
+    com = tuple(candidate.center)
+    mass = candidate.mass
+
+    scored = [(_dist_sq(com, entry[1]), entry) for entry in reference]
+    best_d = min(d for d, _ in scored)
+    tie_tol = 1e-6  # squared mm -- ~1 micron; see docstring
+    tied = [entry for d, entry in scored if d - best_d <= tie_tol]
+    if len(tied) == 1:
+        return tied[0]
+
+    try:
+        best_entry, best_overlap = None, -1.0
+        for entry in tied:
+            overlap = (candidate * _as_occ_solid(entry[5])).mass
+            if overlap > best_overlap:
+                best_overlap, best_entry = overlap, entry
+        if best_overlap > 0.0:
+            return best_entry
+        log_fn(
+            "Palace: WARNING — geometric containment check found no real "
+            f"overlap among {len(tied)} COM-tied candidates for a solid "
+            "of mass "
+            f"{mass:.4g} -- falling back to closest-volume match.\n"
+        )
+    except Exception as exc:
+        log_fn(
+            "Palace: WARNING — geometric containment check failed "
+            f"({exc}) among {len(tied)} COM-tied candidates for a solid "
+            f"of mass {mass:.4g} -- falling back to closest-volume "
+            "match.\n"
+        )
+
+    return min(tied, key=lambda entry: abs(entry[4] - mass) / entry[4] if entry[4] else float("inf"))
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +401,44 @@ def _face_plane(fc_face):
     return (n.x, n.y, n.z, n.x * com.x + n.y * com.y + n.z * com.z)
 
 
+def _approx_face_normal(verts):
+    """Unit normal of a planar candidate face, estimated from its own
+    vertices (cross product of the two longest independent edge vectors
+    from a common base point) rather than any parametric surface
+    evaluation -- avoids needing a valid (u,v) inside the face's actual
+    trimmed region, which .surf.Normal(u, v) requires and which isn't
+    known in advance for an arbitrary candidate.
+
+    Returns None if fewer than 3 distinct points are found (e.g. a face
+    bounded entirely by curves, with no straight-edge corners at all) --
+    callers must treat that as "orientation unknown", not "reject".
+    """
+    uniq = []
+    for v in verts:
+        p = (v.p[0], v.p[1], v.p[2])
+        if not any(abs(p[0] - q[0]) < 1e-9 and abs(p[1] - q[1]) < 1e-9
+                   and abs(p[2] - q[2]) < 1e-9 for q in uniq):
+            uniq.append(p)
+    if len(uniq) < 3:
+        return None
+    base = uniq[0]
+    best_mag_sq, best_n = -1.0, None
+    for i in range(1, len(uniq)):
+        for j in range(i + 1, len(uniq)):
+            e1 = tuple(uniq[i][k] - base[k] for k in range(3))
+            e2 = tuple(uniq[j][k] - base[k] for k in range(3))
+            cx = e1[1] * e2[2] - e1[2] * e2[1]
+            cy = e1[2] * e2[0] - e1[0] * e2[2]
+            cz = e1[0] * e2[1] - e1[1] * e2[0]
+            mag_sq = cx * cx + cy * cy + cz * cz
+            if mag_sq > best_mag_sq:
+                best_mag_sq, best_n = mag_sq, (cx, cy, cz)
+    if best_mag_sq < 1e-18:
+        return None  # every vertex collinear -- degenerate, can't tell
+    mag = best_mag_sq ** 0.5
+    return (best_n[0] / mag, best_n[1] / mag, best_n[2] / mag)
+
+
 def _match_occ_faces(candidate_faces, fc_face, min_tol=0.05):
     """Return the occ.Face objects among candidate_faces that are coplanar
     with and contained inside fc_face's boundary.
@@ -339,6 +492,71 @@ def _match_occ_faces(candidate_faces, fc_face, min_tol=0.05):
     face's plane purely from the box being so short. Checking only the
     centroid can't tell a genuinely flat, coplanar sub-piece from a
     perpendicular face that merely straddles the same plane at its middle.
+
+    The containment check itself also needs to look past the centroid, not
+    just judge flatness that way: on a real board, a large, genuinely flat
+    fragment of the airbox's own wall (35mm^2, an oddly-shaped remainder
+    left over once the wall was fragmented around a wave port's own
+    rectangle) had a centroid that geometrically fell inside the port's
+    50mm^2 target footprint even though the fragment's own extent reached
+    2.5mm beyond the target's edge on both sides -- passing the area cap
+    (since 35 < 50) and the flatness check (it's genuinely coplanar) but
+    still not a real sub-piece of fc_face. Every vertex of the candidate,
+    not just its centroid, must also lie within fc_face's own boundary.
+
+    The centroid is not used for this containment check at all -- only the
+    candidate's own vertices are, via distToShape against fc_face itself.
+    An earlier version also required the centroid to be within `tol` of
+    fc_face before ever looking at the vertices, layered in front of the
+    vertex check above. That centroid requirement turned out to be pure
+    risk with no remaining benefit: confirmed on a second real board (a
+    coax-to-microstrip transition), a wave port's own dielectric target
+    face had a candidate whose area matched exactly and whose *every*
+    vertex sat exactly on the target face (distToShape = 0.0 for each) --
+    about as strong a genuine-match signal as geometry gets -- yet the
+    centroid check rejected it anyway, because Netgen's own Face.center for
+    this particular shape lands 0.635mm from the true face, entirely
+    in-plane (its out-of-plane component was exact), past even this
+    function's own scaled-tolerance cap. Removing the centroid-to-face
+    check and keeping everything else (area cap, centroid-to-*plane* check,
+    vertex flatness, vertex containment) produced the correct match on that
+    board, and produced byte-identical results on the board the vertex
+    check was originally added for -- confirming the centroid check was
+    never actually the deciding factor on either board, just an extra,
+    less reliable gate in front of a check that was already sufficient on
+    its own.
+
+    The flatness check has its own precision blind spot: it compares each
+    vertex's distance from the target's plane against `min_tol`, a small
+    *fixed* value (0.05mm by default) -- deliberately fixed, per the
+    reasoning above, so it isn't fooled by a large target's scaled `tol`.
+    But "fixed" also means it can coincide almost exactly with a real
+    feature's own size. Confirmed on a real board: several SMD components'
+    impedance-boundary target faces are the top of a 0.05mm-tall contact
+    pad -- exactly min_tol's own default -- and that pad's *side walls*
+    (a genuinely perpendicular face, straddling the target's plane from
+    Z=0 to Z=0.05) still matched: BREP export/reimport left one vertex's
+    computed distance at 0.049999999999999996 instead of the mathematically
+    exact 0.05, just under the `>= min_tol` rejection by floating-point
+    noise alone. This produced 4 matched faces where 2 was correct, and
+    fed a Palace run a boundary attribute spanning both a true exterior
+    face and an interior one -- logged by Palace itself as "Found boundary
+    attribute with internal and external boundary elements" -- which
+    crashed the solver outright (SIGBUS) during matrix assembly.
+
+    Fixed by adding an orientation check that doesn't depend on comparing
+    small distances near an arbitrary threshold at all: estimate the
+    candidate's own normal from its vertices (`_approx_face_normal`) and
+    require it to be parallel (not perpendicular) to the target's --
+    confirmed on the same board to cleanly separate every case, with
+    `|dot|` landing at 1.0 (to BREP precision) for every genuine match and
+    at 0.0 for every perpendicular side wall, no matter how the box's own
+    height happens to compare to min_tol. Skipped, not treated as a
+    rejection, when a normal can't be estimated (fewer than 3 distinct
+    vertices, or all of them collinear -- a face bounded entirely by
+    curves, no straight-edge corners to take a cross product from), so
+    this can only ever reject an additional case, never let through one
+    the flatness check would otherwise have caught.
     """
     import Part as FCPart
 
@@ -365,8 +583,18 @@ def _match_occ_faces(candidate_faces, fc_face, min_tol=0.05):
         if any(abs(nx * v.p[0] + ny * v.p[1] + nz * v.p[2] - plane_d) >= min_tol
                for v in verts):
             continue
-        dist, _, _ = fc_face.distToShape(FCPart.Vertex(FreeCAD.Vector(*c)))
-        if dist > tol:
+        # Belt-and-suspenders on top of the flatness check above: compare
+        # the candidate's own orientation, not just how close its vertices
+        # sit to the target's plane. Needed because "close to the plane"
+        # can itself be an unreliable signal at BREP-precision boundaries
+        # -- see _approx_face_normal's docstring for the real case that
+        # proved it. Skipped (not rejected) when a normal can't be
+        # estimated at all, e.g. a face with too few straight-edge corners.
+        cn = _approx_face_normal(verts)
+        if cn is not None and abs(cn[0] * nx + cn[1] * ny + cn[2] * nz) < 0.99:
+            continue
+        if any(fc_face.distToShape(FCPart.Vertex(FreeCAD.Vector(*v.p)))[0] > tol
+               for v in verts):
             continue
         matched.append(f)
     return matched
@@ -717,20 +945,48 @@ def _curved_tet_quality_batch(coords_all):
     return sj.min(axis=1)
 
 
-def _check_curved_mesh_quality(mesh, log_fn, threshold):
+def _tet_volume_batch(coords_all):
+    """coords_all: (N, 10, 3) (only the first 4 corners are used). Returns
+    (N,) straight-sided tet volume per element -- exact for the underlying
+    corners regardless of edge curvature, and cheap; a curved element's true
+    volume differs only by the (small, by construction) curvature correction,
+    which doesn't matter here since this is only ever used as a *weight* for
+    ranking how much of the mesh a quality defect affects, not a physical
+    quantity in its own right.
+    """
+    corners = coords_all[:, :4, :]
+    v0 = corners[:, 1] - corners[:, 0]
+    v1 = corners[:, 2] - corners[:, 0]
+    v2 = corners[:, 3] - corners[:, 0]
+    return np.abs(np.sum(v0 * np.cross(v1, v2), axis=1)) / 6.0
+
+
+def _check_curved_mesh_quality(mesh, log_fn, threshold,
+                                volume_fraction_threshold=0.01,
+                                inverted_volume_fraction_threshold=0.001):
     """Real curved-element quality gate -- see module note above. Matches
     _check_mesh_quality()'s exact dict contract so format_quality_warning()
     and every UI call site work unchanged regardless of backend.
+
+    is_bad is volume-weighted, not a raw element count -- see
+    palace.meshing._check_mesh_quality's docstring for the full reasoning
+    and the empirical data behind it (verified on both backends, this one
+    included: a real board's mesh with 18 genuinely inverted elements
+    confined to 0.0002% of its volume, and a smaller one with 2 inversions
+    at 0.011% of its volume that ran through an actual Palace solve to a
+    physically sane result with no crash).
     """
     if threshold <= 0.0:
         return {"min_quality": None, "n_elements": 0, "n_bad": 0,
-                "bad_fraction": 0.0, "is_bad": False}
+                "bad_fraction": 0.0, "bad_volume_fraction": 0.0,
+                "inverted_volume_fraction": 0.0, "is_bad": False}
 
     els = list(mesh.Elements3D())
     n = len(els)
     if n == 0:
         return {"min_quality": None, "n_elements": 0, "n_bad": 0,
-                "bad_fraction": 0.0, "is_bad": False}
+                "bad_fraction": 0.0, "bad_volume_fraction": 0.0,
+                "inverted_volume_fraction": 0.0, "is_bad": False}
 
     # Gather each element's 10 node coordinates, deduplicating shared nodes
     # via PointId.nr as a plain hashable key (MeshPoint objects from
@@ -752,26 +1008,38 @@ def _check_curved_mesh_quality(mesh, log_fn, threshold):
     coords_all = np.asarray(coords_list)[elem_ids]  # (N, 10, 3)
 
     quals = _curved_tet_quality_batch(coords_all)
+    vols = _tet_volume_batch(coords_all)
     min_quality = float(quals.min())
-    n_bad = int(np.count_nonzero(quals < threshold))
+    bad_mask = quals < threshold
+    inverted_mask = quals < 0.0
+    n_bad = int(np.count_nonzero(bad_mask))
+    total_vol = float(vols.sum())
+    bad_vol_frac = float(vols[bad_mask].sum() / total_vol) if total_vol > 0 else 0.0
+    inverted_vol_frac = float(vols[inverted_mask].sum() / total_vol) if total_vol > 0 else 0.0
 
     result = {
         "min_quality": min_quality,
         "n_elements": n,
         "n_bad": n_bad,
         "bad_fraction": n_bad / n,
-        "is_bad": n_bad > 0,
+        "bad_volume_fraction": bad_vol_frac,
+        "inverted_volume_fraction": inverted_vol_frac,
+        "is_bad": bool(bad_vol_frac > volume_fraction_threshold
+                       or inverted_vol_frac > inverted_volume_fraction_threshold),
     }
     if result["is_bad"]:
         log_fn(
             f"Palace: WARNING — mesh quality check found {n_bad}/{n} tetrahedra "
             f"below quality {threshold:.3g} (worst = {min_quality:.4g}, curved "
-            f"scaled-Jacobian). Degenerate/sliver elements can cause Palace "
-            f"solver instability or inaccurate results.\n"
+            f"scaled-Jacobian), {bad_vol_frac * 100:.3g}% of mesh volume "
+            f"({inverted_vol_frac * 100:.3g}% genuinely inverted). "
+            f"Degenerate/sliver elements can cause Palace solver instability or "
+            f"inaccurate results.\n"
         )
     else:
         log_fn(f"Palace: Mesh quality check passed ({n} tetrahedra, worst = "
-               f"{min_quality:.4g}).\n")
+               f"{min_quality:.4g}, {bad_vol_frac * 100:.3g}% of volume below "
+               f"threshold).\n")
     return result
 
 
@@ -845,25 +1113,33 @@ def generate_mesh_netgen(doc, output_dir, log_fn=None):
     bg_solids = list(background_shape.solids)
     log_fn(f"Palace: {len(bg_solids)} background solid(s) loaded from STEP\n")
 
-    # Reference list for COM matching: (label, com, kind, mesh_attribute)
+    # Reference list for COM matching: (label, com, kind, mesh_attribute,
+    # volume, geom) -- geom is a FreeCAD Part.Shape here, the only thing
+    # available before anything has gone through netgen.occ; _match_reference
+    # converts it lazily, only if a tie ever needs geometric containment.
     reference = []
-    solid_manifest = [{"kind": "airbox", "label": _airbox_solid.Label,
-                        "com": tuple(_airbox_solid.Shape.CenterOfGravity),
-                        "attr": 1}]
+    solid_manifest = [
+        ("airbox:" + _airbox_solid.Label, tuple(_airbox_solid.Shape.CenterOfGravity),
+         "airbox", 1, _airbox_solid.Shape.Volume, _airbox_solid.Shape),
+    ]
     for grp, solid in diel_bodies:
-        solid_manifest.append({
-            "kind": "dielectric", "label": solid.Label,
-            "com": tuple(solid.Shape.CenterOfGravity), "attr": grp.MeshAttribute,
-        })
+        solid_manifest.append((
+            "dielectric:" + solid.Label, tuple(solid.Shape.CenterOfGravity),
+            "dielectric", grp.MeshAttribute, solid.Shape.Volume, solid.Shape,
+        ))
+    # Same ambiguity _match_reference's own docstring covers can arise here
+    # too, even with no conductor in the picture yet -- e.g. a dielectric
+    # shell concentric with the airbox itself, or with another dielectric.
+    # Reuse the one tested implementation rather than a second hand-rolled
+    # nearest-COM loop.
     for s in bg_solids:
         com = tuple(s.center)
-        best, best_d = None, float("inf")
-        for m in solid_manifest:
-            d = _dist_sq(com, m["com"])
-            if d < best_d:
-                best_d, best = d, m
-        reference.append((best["kind"] + ":" + best["label"], com, best["kind"], best["attr"]))
-        s.name = best["kind"] + ":" + best["label"]
+        label, _com, kind, attr, _vol, _geom = _match_reference(s, solid_manifest, log_fn)
+        # geom = s itself (already netgen.occ, from this STEP re-import) --
+        # keeps the second call site's containment checks free of any
+        # FreeCAD roundtrip even though this material started life as one.
+        reference.append((label, com, kind, attr, s.mass, s))
+        s.name = label
 
     # --- Conductors: fuse + BREP export, exactly mirroring
     # _import_conductor_solids's approach. --------------------------------
@@ -891,7 +1167,7 @@ def generate_mesh_netgen(doc, output_dir, log_fn=None):
             com = tuple(s.center)
             entry_label = "cond:" + grp.Label
             s.name = entry_label
-            reference.append((entry_label, com, "conductor", grp.MeshAttribute))
+            reference.append((entry_label, com, "conductor", grp.MeshAttribute, s.mass, s))
         conductor_shapes.append(cshape)
         log_fn(f"Palace: Conductor '{grp.Label}' -> "
                f"{len(list(cshape.solids))} solid(s) imported\n")
@@ -1024,7 +1300,7 @@ def generate_mesh_netgen(doc, output_dir, log_fn=None):
 
     resolved = []   # (solid, label, kind, attr)
     for s in glued_solids:
-        label, com, kind, attr = _match_reference(tuple(s.center), reference)
+        label, com, kind, attr, _volume, _geom = _match_reference(s, reference, log_fn)
         s.name = label
         resolved.append((s, label, kind, attr))
 
@@ -1227,9 +1503,11 @@ def generate_mesh_netgen(doc, output_dir, log_fn=None):
     mesh.SecondOrder()
     mesh.Curve(2)
 
+    _vol_thresh, _inv_vol_thresh = _mesh_quality_volume_thresholds(doc)
     quality = _check_curved_mesh_quality(
         mesh, log_fn,
         _mesh_quality_threshold(doc),
+        _vol_thresh, _inv_vol_thresh,
     )
 
     # Wave ports' own outer boundary curve, PEC-tagged (attr 2, matching
@@ -1257,3 +1535,17 @@ def _mesh_quality_threshold(doc):
     from features import find_palace_mesh
     _mesh_obj = find_palace_mesh(doc)
     return getattr(_mesh_obj, "MeshQualityWarnThreshold", 0.1) if _mesh_obj else 0.1
+
+
+def _mesh_quality_volume_thresholds(doc):
+    """(volume_fraction_threshold, inverted_volume_fraction_threshold) -- the
+    two thresholds _check_curved_mesh_quality uses to turn per-element
+    quality/volume into is_bad. Same find_palace_mesh/getattr fallback
+    pattern as _mesh_quality_threshold, just for the two newer properties.
+    """
+    from features import find_palace_mesh
+    _mesh_obj = find_palace_mesh(doc)
+    if not _mesh_obj:
+        return 0.01, 0.001
+    return (getattr(_mesh_obj, "MeshQualityVolumeFraction", 0.01),
+            getattr(_mesh_obj, "MeshQualityInvertedVolumeFraction", 0.001))

@@ -266,7 +266,7 @@ class _SweepCoordinator:
                 sim.MeshFile = mesh_path
             try:
                 from commands.cmd_run import _update_mesh_object
-                _update_mesh_object(doc, mesh_path, geometry_path=geometry_path)
+                _update_mesh_object(doc, mesh_path, geometry_path=geometry_path, quality=quality)
             except Exception as exc:
                 FreeCAD.Console.PrintWarning(f"Palace sweep: mesh display update failed: {exc}\n")
 
@@ -627,7 +627,7 @@ class _OptimizationCoordinator(QObject):
                 sim.MeshFile = mesh_path
             try:
                 from commands.cmd_run import _update_mesh_object
-                _update_mesh_object(doc, mesh_path, geometry_path=geometry_path)
+                _update_mesh_object(doc, mesh_path, geometry_path=geometry_path, quality=quality)
             except Exception as exc:
                 FreeCAD.Console.PrintWarning(f"Palace optimize: mesh display update failed: {exc}\n")
 

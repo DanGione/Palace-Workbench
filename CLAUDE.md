@@ -22,6 +22,7 @@ verified by running the container and exercising the GUI directly.
 | `palace/mesh_dispatch.py` | The one place that picks Gmsh vs. Netgen per `Simulation.MeshBackend` — every call site imports `generate_mesh` from here, never directly from `palace.meshing`/`palace.netgen_meshing` |
 | `palace/results_db.py` | xarray/NetCDF4 read/write; `append_sweep_point` concatenates sweep runs |
 | `palace/embedded_files.py` | Wraps `App::PropertyFileIncluded` so generated artifacts live inside the `.FCStd` |
+| `palace/shm_cleanup.py` | Pre-flight `/dev/shm` cleanup for orphaned Open MPI `vader_segment.*` files, called by `palace/runner.py` before every Palace launch — see the invariant below |
 | `docs/` | End-user markdown docs (rendered on GitHub) |
 | `tests/` | `pytest` coverage for `palace/`/`features/`, mirroring the source layout |
 
@@ -393,7 +394,7 @@ used (`palace/mesh_runner.py`/`mesh_worker_main.py`) — no separate venv
 needed, confirmed by installing it alongside `gmsh` in the same `pip install`
 line with no conflict.
 
-Three real, production-confirmed bugs fixed here that must not regress:
+Four real, production-confirmed bugs fixed here that must not regress:
 
 - **Internal material-interface faces must never inherit the outer-boundary
   default.** A `FaceDescriptor` nobody explicitly `.bc()`-tagged keeps
@@ -419,10 +420,126 @@ Three real, production-confirmed bugs fixed here that must not regress:
   have its centroid sit within the plane-distance tolerance purely because
   the box is short — rejected by requiring every one of the candidate's own
   vertices, not just its centroid, to lie within a small **fixed** (not
-  area-scaled) tolerance of the target's plane. Full reasoning for both,
-  plus the original annular-port centroid-mismatch case the scaled tolerance
+  area-scaled) tolerance of the target's plane. A third variant hits the
+  containment check itself: a large, genuinely flat and coplanar fragment
+  of the airbox's own wall can still have a centroid that geometrically
+  falls inside a smaller target face's own footprint (not just "near" it —
+  literally inside its 2-D boundary) while the fragment's own extent
+  reaches well beyond the target's edge — confirmed on a real board,
+  2.5mm past the target's own edge on both sides, at two different wave
+  ports simultaneously. The area cap doesn't catch it (the fragment was
+  *smaller* than the target), so every one of the candidate's own
+  vertices, not just its centroid, must also lie within the target's own
+  boundary via `distToShape`. Full reasoning for all three variants, plus
+  the original annular-port centroid-mismatch case the scaled tolerance
   exists for, is in the function's own docstring — read it before touching
   this function again.
+
+  A fourth board (`Coax_to_Microstrip_wComponents.FCStd`, forced onto the
+  Netgen backend) showed the vertex-containment check above wasn't even
+  being reached: a **centroid**-to-face containment check ran first (same
+  scaled tolerance, capped at 0.5mm) and rejected a candidate whose area
+  matched the target exactly and whose *every vertex* sat exactly on the
+  target face (`distToShape` = 0.0 each) — about as strong a genuine-match
+  signal as geometry gets — because Netgen's own `Face.center` for this
+  particular shape lands 0.635mm from the true face, entirely in-plane
+  (its out-of-plane component was exact). That centroid-to-face check has
+  been removed outright: confirmed it was pure risk with no remaining
+  benefit — re-running the fix against the board the vertex-containment
+  check was originally added for produced byte-identical face-match counts
+  and mesh-quality numbers to before, so the vertex check alone was
+  already sufficient there too. The centroid-to-*plane* check earlier in
+  the same function (a different, coarser pre-filter) is unaffected and
+  stays.
+
+  A fifth case (`Coax_Directional_Bridge.FCStd` and `projects/Directional
+  Bridge.FCStd`, both via SMD-component impedance boundaries) found the
+  *flatness* check has the same class of problem the centroid checks did —
+  precision, not logic. It compares each vertex's distance from the
+  target's plane against `min_tol`, a small **fixed** value (0.05mm by
+  default) — and several SMD contact pads on these boards are themselves
+  exactly 0.05mm tall, so a genuinely perpendicular side-wall face (straddling
+  the target's plane from Z=0 to Z=0.05) had one vertex's computed distance
+  land at `0.049999999999999996` instead of the mathematically exact `0.05`
+  after a BREP roundtrip — just under the `>= min_tol` rejection by
+  floating-point noise alone. This matched 4 faces where 2 was correct
+  (confirmed the same mechanism explains a `10` vs. the correct `2` on
+  `projects/Directional Bridge.FCStd`, noted as unexplained earlier in this
+  same investigation), and fed Palace a boundary attribute spanning both an
+  interior and an exterior face — logged by Palace itself as "Found
+  boundary attribute with internal and external boundary elements" —
+  which crashed the solver outright (SIGBUS) during matrix assembly.
+  Fixed by adding `_approx_face_normal` (estimates a candidate's own
+  normal from its vertices via cross product, not any parametric surface
+  evaluation) and requiring it to be parallel, not perpendicular, to the
+  target's — confirmed on the real board to cleanly separate every case,
+  `|dot|` landing at `1.0` (to BREP precision) for every genuine match and
+  `0.0` for every perpendicular side wall, regardless of how the box's own
+  height happens to compare to `min_tol`. Skipped (not treated as a
+  rejection) when a normal can't be estimated at all (fewer than 3 distinct
+  vertices), so this can only reject an *additional* case beyond what the
+  flatness check already catches, never let one through.
+- **`_match_reference` needs a geometric-containment tiebreak for entries
+  tied on center of mass**, not a volume-based heuristic. Solids that are
+  coaxial and axially centered at the same point — a coax cable's center
+  pin, its surrounding annular dielectric spacer, and its outer shield
+  tube, when the spacer and shield happen to be the same length — all
+  share a center of mass, and nearest-COM alone cannot rank entries that
+  are exactly (or near-exactly) tied. Confirmed on a real board across
+  three rounds of hardening: first the whole PTFE spacer (volume 47.6)
+  matched the coax pin's own conductor reference (volume 6.2) purely
+  because their COMs coincided, silently excluding the whole dielectric
+  from the 3-D mesh (conductor volumes are removed, not meshed as a
+  domain) and PEC-tagging every one of its faces — including both flat
+  end-caps — as if they were the conductor's own. A volume-floor fix
+  (reject any reference entry too small to contain the candidate) wasn't
+  enough — confirmed by testing it against the same document: the shield
+  tube (volume 41.2) is smaller than the spacer (47.6), so it still passed
+  the floor, and the tube itself then started matching the spacer's
+  reference instead of its own. A closest-volume tiebreak fixed that
+  specific case but is still only a heuristic — an asymmetrically
+  fragmented layer could in principle have its reduced volume land closer
+  to some *other* tied entry's full volume than to its own.
+
+  The actual fix: rank by COM distance first, same as always (cheap, and
+  correct for the vast majority of solids with no such ambiguity at all).
+  Only when two or more entries are tied to within `tie_tol` (~1 micron —
+  BREP/COM roundoff, not a real physical separation) is the real,
+  decisive question asked instead of estimated — does the candidate solid
+  actually sit inside a tied reference's own original geometry? Verified
+  empirically that `netgen.occ`'s own `*` (Boolean intersection) operator
+  answers this cleanly, with no roundtrip needed between two shapes
+  already in that kernel: a candidate intersected with its true parent
+  returns its own full volume; intersected with a merely-*touching*
+  different material — the exact adjacency concentric layers have with
+  each other — returns exactly `0.0`. Reference entries now carry the
+  actual geometry needed for this (a 6th tuple field, `geom`) — a netgen.occ
+  solid where one is already in hand (conductor entries, and background
+  entries once identified), or a FreeCAD `Part.Shape` where nothing else
+  exists yet (the background/dielectric manifest built before anything
+  has touched netgen.occ), converted to netgen.occ lazily
+  (`_as_occ_solid`) only if a tie involving it is ever actually detected —
+  so this costs nothing for the common, unambiguous case. Closest-volume
+  is kept only as a fallback-of-a-fallback, for when containment itself
+  can't decide (an OCC Boolean failure — an established, handled risk
+  elsewhere in this file — or every tied entry's overlap coming back zero),
+  logging a `Palace: WARNING —` either way so a real ambiguity never
+  resolves silently on the weaker path. Read `_match_reference`'s own
+  docstring — it walks through why neither a floor nor a volume tiebreak
+  alone is enough — before touching this function again. Running
+  containment for every candidate against every reference unconditionally
+  (skipping the COM pre-filter entirely) was considered and rejected as
+  needless work for the ~95% of solids that are already unambiguous, and
+  it would scale worse on boards with many more solids than this one's 43.
+
+  `generate_mesh_netgen()` calls this same function at **two** points —
+  identifying each raw background (airbox/dielectric) solid straight off
+  the STEP re-import, and again for every post-`Glue()` solid once
+  conductors and ports are combined in — the first of these used to be a
+  second, separate, un-hardened nearest-COM loop with none of this
+  protection; a concentric dielectric shell (even with no conductor
+  involved at all) could have hit the identical bug there. Both call sites
+  now go through the one tested implementation.
 - **`_wave_port_boundary_edges` (the Netgen equivalent of `palace.meshing`'s
   `PortBoundaryCurves`) must NOT exclude conductor-adjacent edges.** It once
   did, by analogy with Gmsh's `cond_skip_planes` — but that analogy was
@@ -454,6 +571,101 @@ grid to points that actually lie on the bounded face, via the same
 `Part.Face.isInside()` is avoided (unreliable on a naked, non-solid face).
 Falls back to the unfiltered grid if filtering would remove every point, so
 this can never produce fewer usable probes than before.
+
+### Mesh-quality `is_bad` is volume-weighted, not a raw element count — `palace/meshing.py`, `palace/netgen_meshing.py`
+Both backends classify tetrahedra as "bad" the same way — Gmsh's own
+`minSICN`, Netgen's curved scaled-Jacobian (`_curved_tet_quality_batch`),
+each below `MeshQualityWarnThreshold` (default 0.1) — but used to decide
+`is_bad = n_bad > 0`: **one** bad element out of any number flagged the
+*entire* mesh, feeding a blocking "Keep this mesh?"/"Run anyway?"
+`QMessageBox` (`cmd_mesh.py`, `cmd_run.py`) that defaults to **No**.
+Verified empirically to be a bad proxy for actual risk: mesh generation was
+run, both backends forced (not just each document's own default), against
+every example board in this repo plus a real in-progress board, capturing
+full per-element quality *and volume* — every one of them, including
+several with confirmed genuinely-inverted (negative-quality, not just
+low-but-valid) elements, showed volume-weighted badness under 0.5% (usually
+under 0.05%), while the old element-count fraction swung from under 0.01%
+to over 23% *on the same document* depending only on which backend meshed
+it — count doesn't just add noise, it doesn't even rank the two backends'
+actual mesh quality consistently. A real Palace solve (not just a mesh
+check) was run directly via `palace.runner.run_palace()` against a mesh
+with 2 confirmed inversions (0.011% of its volume): it completed cleanly
+and produced physically sane S-parameters, direct (not inferred)
+confirmation that a small-volume inversion neither crashes the solver nor
+corrupts the result.
+
+`is_bad` is now `bad_volume_fraction > MeshQualityVolumeFraction (default
+1%) or inverted_volume_fraction > MeshQualityInvertedVolumeFraction
+(default 0.1%)` — both new `PalaceMesh` properties (`features/mesh.py`,
+same "Refinement" group and `getattr(..., default)` fallback pattern as
+`MeshQualityWarnThreshold`). Genuine inversions (quality < 0) get their own
+stricter threshold since a folded/self-intersecting element is a
+qualitatively worse defect than a merely-thin one, even at equal volume.
+`n_bad`/`bad_fraction` (the old element-count stats) are kept in the
+returned dict for diagnostic/log context but no longer decide `is_bad` on
+their own. Confirmed the one synthetic case already proving the check can
+catch a *real* problem (`test_check_mesh_quality_flags_degenerate_mesh`, a
+deliberately 40x-too-coarse thin plate) is bad by volume too (100%, not
+just by count) — this fix doesn't trade a false-positive problem for a
+false-negative one. `commands/cmd_run.py`/`cmd_mesh.py`/`cmd_sweep.py`
+needed no changes at all — they only ever read `quality["is_bad"]` and pass
+the whole dict to `format_quality_warning()`, so only what causes the
+dialog to fire changed, not the dialog/blocking behavior itself.
+
+### `/dev/shm` cleanup for orphaned Open MPI `vader` segments — `palace/runner.py`, `palace/shm_cleanup.py`
+Open MPI's `vader` BTL (its shared-memory transport for intra-node inter-rank
+communication) creates one file per rank in `/dev/shm`, named
+`vader_segment.<hostname>.<uid>.<jobid>.<rank>`. These are removed on a
+clean exit but are **left behind** whenever a Palace/`mpirun` job crashes or
+is killed (`SIGKILL`, including via `CmdStopRun`'s `killpg`). Docker's
+default `/dev/shm` here is only 64MB (`--shm-size` intentionally left at
+that default, not changed, per explicit decision); on a real production
+document, several days of crashed/killed runs had left 34 orphaned files
+consuming 58MB/64MB (91% full, 6.3MB free), and Palace then crashed with
+`SIGBUS` (signal 7) during matrix assembly on a document with no actual
+mesh/config defect. Manually deleting all 34 files (after confirming via
+`ps`/`pgrep` that no `mpirun`/`palace-x86_64.bin` process was still running)
+brought usage to 0%, and the exact same simulation then ran to completion —
+confirming the cause. This is a **different** root cause than the SIGBUS
+documented under "Netgen meshing backend" above (malformed boundary
+attributes from a face-matching bug) — both happen to produce the identical
+`SIGBUS` signal during matrix assembly, so a future SIGBUS should not be
+assumed to be either one without checking `/dev/shm` usage as well as
+boundary-attribute sanity.
+
+`run_palace()` now calls `palace.shm_cleanup.cleanup_stale_shm_segments()`
+before every launch (once per pass, so a multi-port sweep is re-checked
+before each pass too, at no extra plumbing cost). Liveness is checked
+against real running processes — `/proc/<pid>/fd/*` **and**
+`/proc/<pid>/maps`, both — never file mtime alone, which is a racy proxy
+for "still in use." Both checks are required, not redundant: vader
+`mmap()`s the segment and typically closes the raw fd afterward, so `maps`
+is often the only signal that still shows the reference. **Must not**
+regress to an mtime-only or fd-only check — a currently-running, unrelated
+concurrent Palace simulation's own segments must never be deleted out from
+under it. Every removed and every kept (still-in-use) file is logged
+individually — **must not** go silent, since the failure mode this exists
+for (crash-induced buildup unnoticed for days) is precisely what silent
+cleanup would reproduce. After cleanup, `warn_if_shm_full()` (default
+threshold 80% — a single confirmed data point at 91%-used/crashed and
+0%-used/fixed, no finer-grained measurement exists, so treat this constant
+as a conservative extrapolation, not a validated boundary) logs a real
+`FreeCAD.Console.PrintWarning` if usage is still high even after removing
+everything safely removable — that can only mean a genuinely live
+concurrent job is using the space, so the message tells the user to wait
+or stop another simulation.
+
+`palace/shm_cleanup.py` has no FreeCAD/Qt dependency by design (pure
+`os`/`glob`/`shutil`), so its liveness/removal logic is fully unit-testable
+without mocking `/proc` — a test can `open()` (or `mmap()`) its own
+`tmp_path` file and the *test process itself* then legitimately shows up
+as a live referencer. `run_palace()` is the only place `mpirun`/the Palace
+binary is actually launched in this repo, so hooking only this one function
+is sufficient coverage, including for `commands/cmd_sweep.py`'s
+sweep/optimize runs (which reuse `cmd_run.py`'s
+`_build_passes`/`_launch_passes` → `_PassWorker` → `run_palace()`, the same
+path).
 
 ## Dependencies
 
