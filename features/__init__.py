@@ -135,12 +135,24 @@ def find_palace_mesh(doc):
 
 
 def add_to_simulation(doc, obj):
-    """Add obj to the PalaceSimulation group if one exists and obj is not already in it."""
+    """Add obj to the PalaceSimulation group if one exists and obj is not already in it.
+
+    A failure here is reported, never swallowed silently: this is the only
+    place anything is parented into PalaceSimulation.Group, so an unnoticed
+    failure leaves the object stranded at the document's top level with
+    nothing to ever put it back (the tree offers no drop target for it
+    either). Still does not raise -- a failed re-parent is a tree-layout
+    problem, not a reason to abort whatever operation was under way.
+    """
     sim = find_simulation(doc)
     if sim is None or not hasattr(sim, "Group"):
         return
     if obj not in sim.Group:
         try:
             sim.addObject(obj)
-        except Exception:
-            pass
+        except Exception as exc:
+            import FreeCAD
+            FreeCAD.Console.PrintWarning(
+                f"Palace: WARNING — could not add {obj.Name} to "
+                f"{sim.Name}.Group: {exc}\n"
+            )

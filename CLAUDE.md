@@ -134,6 +134,45 @@ exist yet — a document can already have both the group and the stale
 duplicate baked in, and `get_or_create_*_group`'s own sweep only runs on
 first creation, so only the unconditional restore-time pass self-heals it.
 
+**`sync_all_groups()` repairs three distinct kinds of drift, each found baked
+into a real saved document (`projects/Coax_Directional_Bridge.FCStd`), not
+added defensively.** Besides the stale double-membership above, it now also:
+
+- **Re-parents a group that left `Simulation.Group`.** `add_to_simulation()`
+  is otherwise called *only* by `get_or_create_*_group()`, which returns early
+  when the group already exists — so a group that escaped stayed at the
+  document's top level permanently. There is no drop target for it in the
+  tree either (`ViewProviderSimulation` renders children via `claimChildren()`
+  alone, and `onDocumentRestored` removes
+  `Gui::ViewProviderGroupExtensionPython`), so a user cannot drag it back by
+  hand. Confirmed on that board: its populated Components *and* Impedance
+  Boundaries groups had both escaped.
+- **Merges duplicate groups of the same kind.** The singular
+  `find_*_group()` finders return the FIRST marker match and stop, which makes
+  a second group permanently unreachable — `cleanup_group_if_orphaned()` looks
+  its group up by finder, gets the other object, sees its member isn't in it,
+  and returns, so the duplicate can never be garbage-collected. That board
+  carried a populated `PalaceComponents` *and* an empty `PalaceComponents001`,
+  the latter rendering as an empty "Components" group inside the Simulation.
+  `_consolidate_duplicates()` keeps the first (the one the finders return, so
+  every other code path agrees with the outcome) and moves the losers' members
+  onto it before deleting them.
+- **Prunes a group with zero members**, the restore-time catch-up for the
+  same "delete once the last member is removed" rule
+  `cleanup_group_if_orphaned()` applies during editing. A group holding only
+  unrecognized stray objects is left alone — only genuinely empty ones go.
+
+Relatedly, `delete_component_children()` (`features/component.py`) must call
+`cleanup_group_if_orphaned()` for the component's `ImpedanceBoundaryObj`
+itself: it removes that boundary with `doc.removeObject()`, which does **not**
+fire the ViewProvider's `onDelete` where that cleanup otherwise lives (same
+invariant as the cascade-delete note above). Without it, deleting the last
+Component left an empty Impedance Boundaries group behind with no member left
+to ever trigger its removal. `add_to_simulation()` (`features/__init__.py`)
+logs a `Palace: WARNING —` instead of silently swallowing a failed re-parent —
+it is the only path into `Simulation.Group`, so a silent failure strands the
+object with nothing to put it back.
+
 `features/simulation.py`'s `_is_palace_child()` (used by `_migrate_to_group`,
 the pre-existing "sweep loose Palace objects into `Simulation.Group`"
 migration) no longer matches LumpedPort/WavePort/ImpedanceBoundary — they have

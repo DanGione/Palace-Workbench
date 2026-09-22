@@ -63,7 +63,8 @@ propagation will misalign for every entry after the removed one.
 
 import os
 
-from features import find_dielectric_groups, find_conductor_groups, find_component_group
+from features import (find_dielectric_groups, find_conductor_groups,
+                      find_component_group, find_impedance_boundary_group)
 from features.object_group import add_to_component_group, cleanup_group_if_orphaned
 
 _ICON = os.path.join(os.path.dirname(__file__), "..", "resources", "icons", "Component.svg")
@@ -355,6 +356,13 @@ def delete_component_children(doc, container):
     for shadow in shadows:
         doc.removeObject(shadow.Name)
     if boundary is not None and boundary.Name in live_names:
+        # doc.removeObject() does NOT fire the ViewProvider's onDelete (see this
+        # function's own docstring), which is where an ImpedanceBoundary would
+        # otherwise clean up its group -- so that cleanup has to happen here,
+        # explicitly, or deleting the last Component leaves an empty Impedance
+        # Boundaries group behind forever. Called while the boundary is still a
+        # member, matching cleanup_group_if_orphaned's calling convention.
+        cleanup_group_if_orphaned(doc, find_impedance_boundary_group, boundary)
         doc.removeObject(boundary.Name)
 
     still_live = {o.Name for o in doc.Objects}

@@ -210,3 +210,35 @@ def test_regenerate_on_edit_preserves_port_index(doc):
     assert boundaries[0].R == 0.0
     assert new_container.ComponentType == "Capacitor"
     assert new_container.SizeCode == "0603"
+
+
+def test_delete_smd_component_removes_now_empty_impedance_boundary_group(doc):
+    # The boundary is removed with doc.removeObject(), which does NOT fire the
+    # ViewProvider's onDelete -- where an ImpedanceBoundary would otherwise
+    # clean up its own group. Without an explicit cleanup call in
+    # delete_component_children(), deleting the last component left an empty
+    # "Impedance Boundaries" group behind forever (it could not even be
+    # garbage-collected later: the group is only ever pruned from a member's
+    # own delete hook, and by then there are no members left to fire it).
+    from features import find_impedance_boundary_group
+
+    container = _create(doc)
+    assert find_impedance_boundary_group(doc) is not None
+
+    smdc.delete_smd_component(doc, container)
+
+    assert find_impedance_boundary_group(doc) is None
+
+
+def test_delete_smd_component_keeps_impedance_boundary_group_for_other_components(doc):
+    from features import find_impedance_boundary_group
+
+    first = _create(doc)
+    second = _create(doc)
+    grp = find_impedance_boundary_group(doc)
+    survivor_boundary = second.ImpedanceBoundaryObj
+
+    smdc.delete_smd_component(doc, first)
+
+    assert find_impedance_boundary_group(doc) is grp
+    assert list(grp.Group) == [survivor_boundary]

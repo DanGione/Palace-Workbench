@@ -375,31 +375,103 @@ def cleanup_group_if_orphaned(doc, group_finder, obj):
 # Document-load sync: tidy up an already-scattered document on open
 # ---------------------------------------------------------------------------
 
-def sync_all_groups(doc):
-    """Ensure a group exists for each category that already has members, and
-    that none of those members is ALSO left as a stale direct member of
-    PalaceSimulation.Group -- called on every document restore, not only
-    when a group doesn't exist yet.
+def _groups_with_marker(doc, marker):
+    """Every object in doc carrying the given group-marker property.
 
-    The unconditional re-sweep (not just "create if missing") matters: a
-    document can already have both the group AND stale direct
-    Simulation.Group membership baked in (from before this feature existed,
-    or from before ImpedanceBoundary/etc. was trimmed out of
-    _is_palace_child) -- get_or_create_*_group's own sweep only runs on
-    first creation, so re-opening such a document without this unconditional
-    pass would keep leaving those objects doubled in the tree forever, never
-    self-healing. Never creates a group speculatively -- each get_or_create_*
-    call below is itself gated on there being at least one matching object.
+    The singular find_*_group() helpers in features/__init__.py return the
+    FIRST match and stop, which silently tolerates a document that somehow
+    ended up with two groups of the same kind -- the second one is then
+    unreachable forever: cleanup_group_if_orphaned() looks its group up by
+    finder, gets the other object, sees its member isn't in it and returns,
+    so the duplicate can never be garbage-collected. Confirmed on a real
+    board (projects/Coax_Directional_Bridge.FCStd), which carried both a
+    populated PalaceComponents and an empty PalaceComponents001.
     """
-    if find_wave_ports(doc) or find_lumped_ports(doc):
-        grp = get_or_create_port_group(doc)
-        for p in find_wave_ports(doc) + find_lumped_ports(doc):
-            _add_member(doc, grp, p)
-    if find_impedance_boundaries(doc):
-        grp = get_or_create_impedance_boundary_group(doc)
-        for b in find_impedance_boundaries(doc):
-            _add_member(doc, grp, b)
-    if find_components(doc):
-        grp = get_or_create_component_group(doc)
-        for c in find_components(doc):
-            _add_member(doc, grp, c)
+    return [obj for obj in doc.Objects if hasattr(obj, marker)]
+
+
+def _consolidate_duplicates(doc, marker):
+    """Merge any duplicate groups of one kind down to a single survivor.
+
+    The survivor is the first in doc.Objects order -- the same object the
+    singular find_*_group() returns -- so every other code path agrees with
+    the outcome. Members of the losers are moved onto the survivor before
+    each loser is deleted, so this can never drop a member.
+
+    Returns the survivor, or None if the document has no group of this kind.
+    """
+    groups = _groups_with_marker(doc, marker)
+    if not groups:
+        return None
+    survivor = groups[0]
+    for dup in groups[1:]:
+        for member in list(getattr(dup, "Group", [])):
+            _add_member(doc, survivor, member)
+        FreeCAD.Console.PrintMessage(
+            f"Palace: merging duplicate group {dup.Name} into {survivor.Name}\n"
+        )
+        doc.removeObject(dup.Name)
+    return survivor
+
+
+def _sync_category(doc, marker, members, get_or_create):
+    """Reconcile one category's group: de-duplicate, populate, re-parent.
+
+    Called for each of the three kinds from sync_all_groups(). Never creates
+    a group speculatively -- get_or_create is only called when the document
+    actually has at least one matching object.
+    """
+    grp = _consolidate_duplicates(doc, marker)
+    if members:
+        grp = get_or_create(doc)
+        for m in members:
+            _add_member(doc, grp, m)
+        # Unconditional re-parent, not just at creation time: add_to_simulation()
+        # is otherwise only ever called by get_or_create_*_group(), which returns
+        # early when the group already exists -- so a group that somehow left
+        # PalaceSimulation.Group stayed outside it permanently, rendering at the
+        # document's top level with no way to put it back (the tree has no drop
+        # target for it either). Confirmed on a real board, where both the
+        # Components and Impedance Boundaries groups had escaped this way.
+        add_to_simulation(doc, grp)
+    elif grp is not None and not grp.Group:
+        # No matching objects left and nothing else parked inside it: the same
+        # "delete once the last member is removed" rule cleanup_group_if_orphaned
+        # applies during editing, caught up on at restore. This also sweeps up
+        # the empty group left behind when a Component's ImpedanceBoundary is
+        # deleted via doc.removeObject() (which never fires the ViewProvider's
+        # onDelete, so that cleanup was skipped).
+        FreeCAD.Console.PrintMessage(
+            f"Palace: removing empty group {grp.Name} (no members left)\n"
+        )
+        doc.removeObject(grp.Name)
+
+
+def sync_all_groups(doc):
+    """Reconcile every auto-managed group with the document, on every restore.
+
+    Three things are repaired here, each confirmed necessary against a real
+    document rather than added defensively:
+
+    1. Members that are ALSO stale direct members of PalaceSimulation.Group
+       (FreeCAD's Group property does not enforce single-parent membership,
+       so those render twice) -- see _add_member.
+    2. Groups that are no longer inside PalaceSimulation.Group at all, which
+       nothing else re-parents -- see _sync_category.
+    3. Duplicate groups of the same kind, of which only the first was ever
+       reachable again -- see _consolidate_duplicates.
+
+    Runs unconditionally, not just when a group is missing: a document can
+    have any of these baked in already, and get_or_create_*_group's own
+    sweep only runs on first creation, so only an unconditional restore-time
+    pass self-heals such a document.
+    """
+    _sync_category(doc, "IsPortGroup",
+                   find_wave_ports(doc) + find_lumped_ports(doc),
+                   get_or_create_port_group)
+    _sync_category(doc, "IsImpedanceBoundaryGroup",
+                   find_impedance_boundaries(doc),
+                   get_or_create_impedance_boundary_group)
+    _sync_category(doc, "IsComponentGroup",
+                   find_components(doc),
+                   get_or_create_component_group)
