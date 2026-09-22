@@ -21,8 +21,11 @@ _COL_STEP  = 3
 class SimulationPanel:
     def __init__(self, obj):
         self.obj = obj
+        self._loading = False
+        self._pre_gpu_settings = None
         self.form = self._build()
         self._populate()
+        self._connect_device_signals()
 
     # ------------------------------------------------------------------
     # Build
@@ -85,6 +88,14 @@ class SimulationPanel:
             "GPU requires the :cuda Docker image variant and an NVIDIA GPU."
         )
         fl.addRow("Device:", self.combo_device)
+
+        # Shown only for GPU runs, and only when something about the current
+        # parallelism settings is wrong for one. See _refresh_device_note.
+        self.lbl_device_note = QtWidgets.QLabel()
+        self.lbl_device_note.setWordWrap(True)
+        self.lbl_device_note.setStyleSheet("color: #c26a00;")
+        self.lbl_device_note.setVisible(False)
+        fl.addRow(self.lbl_device_note)
 
         self.spin_partial_assembly = QtWidgets.QSpinBox()
         self.spin_partial_assembly.setRange(0, 4)
@@ -448,6 +459,7 @@ class SimulationPanel:
 
     def _populate(self):
         o = self.obj
+        self._loading = True
         idx = _SIM_TYPES.index(o.SimulationType) if o.SimulationType in _SIM_TYPES else 0
         self.combo_type.setCurrentIndex(idx)
         self.stack.setCurrentIndex(idx)
@@ -499,6 +511,103 @@ class SimulationPanel:
 
         # Apply tab enable state for initial solver type
         self.tabs.setTabEnabled(2, o.SimulationType == "Driven")
+
+        # Opening a saved document's panel never rewrites its stored values --
+        # it only reports what doesn't suit the device already selected.
+        self._loading = False
+        self._refresh_device_note()
+
+    # ------------------------------------------------------------------
+    # GPU device / parallelism interlock
+    # ------------------------------------------------------------------
+
+    def _connect_device_signals(self):
+        """Wire the device interlock AFTER _populate() has run once.
+
+        Connected here rather than at widget-construction time for the same
+        reason panels/sweep_panel.py's add_row() defers its own combo signal
+        (see CLAUDE.md): _populate() calls setCurrentIndex() on the device
+        combo, which would otherwise fire _on_device_changed and silently
+        auto-correct a saved document's stored values the moment its panel
+        is opened. self._loading guards any later re-populate the same way.
+        """
+        self.combo_device.currentIndexChanged.connect(self._on_device_changed)
+        self.spin_num_procs.valueChanged.connect(lambda _: self._refresh_device_note())
+        self.spin_num_threads.valueChanged.connect(lambda _: self._refresh_device_note())
+        self.chk_parallel.toggled.connect(lambda _: self._refresh_device_note())
+
+    def _gpu_mismatches(self):
+        """Current settings that don't suit a single-GPU run, as display text."""
+        issues = []
+        if self.spin_num_procs.value() > 1:
+            issues.append(f"{self.spin_num_procs.value()} MPI processes")
+        if self.spin_num_threads.value() > 0:
+            issues.append(f"{self.spin_num_threads.value()} OMP threads/rank")
+        if self.chk_parallel.isChecked():
+            issues.append("parallel passes")
+        return issues
+
+    def _refresh_device_note(self, message=None):
+        """Update the note under the Device row. CPU runs never show one."""
+        if _DEVICES[self.combo_device.currentIndex()] != "GPU":
+            self.lbl_device_note.setVisible(False)
+            return
+        if message is None:
+            issues = self._gpu_mismatches()
+            if not issues:
+                self.lbl_device_note.setVisible(False)
+                return
+            message = (
+                "\u26a0 " + ", ".join(issues) + " — on a single GPU use one rank "
+                "per GPU, no OMP threads and serial passes. Extra ranks share and "
+                "time-slice the same device and duplicate its memory. Passes run "
+                "serially on GPU regardless of the checkbox."
+            )
+        self.lbl_device_note.setText(message)
+        self.lbl_device_note.setVisible(True)
+
+    def _on_device_changed(self, _index=None):
+        """Auto-correct CPU-shaped parallelism when the user picks GPU.
+
+        Only ever runs on a real user change of the combo, never during
+        _populate() -- a saved document's values are not rewritten just by
+        opening its panel. Switching back to CPU restores whatever was in
+        effect before the correction, so GPU -> CPU is not a lossy round
+        trip. Every control stays editable throughout: a genuine multi-GPU
+        setup (one rank per GPU) can raise the rank count straight back up,
+        and the note reappears to say what is now mismatched.
+        """
+        if self._loading:
+            self._refresh_device_note()
+            return
+        if _DEVICES[self.combo_device.currentIndex()] == "GPU":
+            issues = self._gpu_mismatches()
+            if not issues:
+                self._refresh_device_note()
+                return
+            self._pre_gpu_settings = (
+                self.spin_num_procs.value(),
+                self.spin_num_threads.value(),
+                self.chk_parallel.isChecked(),
+            )
+            self.spin_num_procs.setValue(1)
+            self.spin_num_threads.setValue(0)
+            self.chk_parallel.setChecked(False)
+            self._refresh_device_note(
+                "\u26a0 Switched to GPU: set MPI processes to 1, OMP threads to 0 "
+                "and unticked \"Run passes in parallel\" (was " + ", ".join(issues) +
+                "). On a single GPU, extra ranks share and time-slice the same "
+                "device rather than adding throughput. Raise them back if you "
+                "have one GPU per rank."
+            )
+        else:
+            previous = self._pre_gpu_settings
+            if previous is not None:
+                self.spin_num_procs.setValue(previous[0])
+                self.spin_num_threads.setValue(previous[1])
+                self.chk_parallel.setChecked(previous[2])
+                self._pre_gpu_settings = None
+            self._refresh_device_note()
 
     # ------------------------------------------------------------------
     # Misc helpers

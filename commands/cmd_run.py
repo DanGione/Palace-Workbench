@@ -1,3 +1,4 @@
+import collections
 import csv
 import FreeCAD
 import FreeCADGui
@@ -134,6 +135,24 @@ class _PassWorker(QThread):
 
     def run(self):
         from palace.runner import run_palace
+        from palace.run_diagnosis import diagnose_failure
+
+        # Palace's own last words are the only place a signal death is
+        # explained (mpirun prints "exited on signal N" and then substitutes
+        # its own exit code), so keep a bounded tail of what streamed past.
+        # The head is kept separately because diagnose_failure() reads the
+        # device off Palace's opening banner ("Device configuration: cuda"),
+        # which scrolls out of a tail-only window on any run long enough to
+        # produce 200 lines -- a late crash would then be misreported as a
+        # CPU one.
+        head = []
+        recent = collections.deque(maxlen=200)
+
+        def _capture(line):
+            if len(head) < 40:
+                head.append(line)
+            recent.append(line)
+            self.log.emit(line)
 
         def _store_proc(p):
             self._proc = p
@@ -142,11 +161,16 @@ class _PassWorker(QThread):
             expected = _expected_freq_count(self._config_path)
 
             for attempt in range(2):
+                # Each attempt is diagnosed on its own output only -- a retry
+                # (frequency-count mismatch) otherwise leaves the previous
+                # attempt's lines in the buffers.
+                head.clear()
+                recent.clear()
                 rc = run_palace(
                     self._config_path, self._binary,
                     num_procs=self._num_procs,
                     num_threads=self._num_threads,
-                    line_callback=self.log.emit,
+                    line_callback=_capture,
                     proc_callback=_store_proc,
                 )
                 self._proc = None
@@ -157,9 +181,17 @@ class _PassWorker(QThread):
                     return
 
                 if rc != 0:
-                    self.pass_done.emit(
-                        self._pass_index, False, f"Palace exited with code {rc}"
-                    )
+                    message = f"Palace exited with code {rc}"
+                    tail = list(recent)
+                    # Only prepend the head when the tail is full, i.e. the
+                    # run produced enough output that the head may have
+                    # scrolled out; otherwise the tail already holds it.
+                    context = head + tail if len(tail) == recent.maxlen else tail
+                    explanation = diagnose_failure(context, rc)
+                    if explanation:
+                        self.log.emit("Palace: " + explanation + "\n")
+                        message = f"{message}\n\n{explanation}"
+                    self.pass_done.emit(self._pass_index, False, message)
                     return
 
                 if expected is None:
@@ -822,6 +854,39 @@ def _find_mesh_file(doc):
     return None
 
 
+def _passes_run_parallel(sim, n_passes):
+    """Decide whether excitation passes run simultaneously or one at a time.
+
+    Returns (parallel, override_reason) -- override_reason is None unless this
+    function overrode the document's own ParallelPasses setting.
+
+    Parallel passes each launch their own independent Palace/mpirun subprocess.
+    With Device=GPU and no per-pass CUDA_VISIBLE_DEVICES pinning (see the
+    TODO(GPU) in _launch_passes), those processes all contend for the same
+    GPU, which -- unlike on CPU -- can run slower than serial execution or
+    exhaust GPU memory outright. GPU runs are therefore forced serial here.
+
+    The document's ParallelPasses property is deliberately NOT written back to:
+    the override is per-launch, and the saved setting is still correct for the
+    same document's CPU runs.
+
+    Pure (no Qt, no FreeCAD document mutation) so it is unit-testable.
+    """
+    parallel = bool(getattr(sim, "ParallelPasses", True)) if sim else True
+    if not parallel or n_passes <= 1:
+        return parallel, None
+    if str(getattr(sim, "Device", "CPU")) != "GPU":
+        return parallel, None
+    return False, (
+        "Device=GPU: running the "
+        f"{n_passes} excitation passes serially, overriding \"Run passes in "
+        "parallel\". Parallel passes are separate Palace processes with no "
+        "per-pass GPU assignment, so they would contend for the same GPU — "
+        "often slower than serial, and a GPU out-of-memory risk. The "
+        "document's own setting is unchanged and still applies to CPU runs."
+    )
+
+
 def _launch_passes(passes, needs_merge, console, sim, binary,
                    num_procs, num_threads, t0_sim, mesh_elapsed=None, tmp_dir=None,
                    on_complete=None, initial_status="Running Palace…",
@@ -830,17 +895,19 @@ def _launch_passes(passes, needs_merge, console, sim, binary,
 
     Must be called on the main thread.  Sets CmdRun._coordinator.
     """
-    parallel = bool(getattr(sim, "ParallelPasses", True)) if sim else True
-    # TODO(GPU): with Device=GPU, parallel passes each independently launch
-    # their own Palace/mpirun subprocess with no CUDA_VISIBLE_DEVICES pinning
-    # -- they all contend for the same GPU(s) regardless of how many are
-    # exposed to the container (docker-compose.cuda.yml's `count: all`), since
-    # nothing here assigns a distinct GPU per pass. See docs/simulation-
-    # reference.md's GPU section for the current workaround (disable "Run
-    # passes in parallel" on a single-GPU box). Robust multi-GPU support
-    # (e.g. round-robin CUDA_VISIBLE_DEVICES per worker, or explicit per-port
-    # GPU assignment) is future work, not yet implemented.
     n = len(passes)
+    # Device=GPU forces serial passes (see _passes_run_parallel) -- parallel
+    # passes each independently launch their own Palace/mpirun subprocess with
+    # no CUDA_VISIBLE_DEVICES pinning, so they all contend for the same GPU(s)
+    # regardless of how many are exposed to the container
+    # (docker-compose.cuda.yml's `count: all`).
+    # TODO(GPU): robust multi-GPU support (e.g. round-robin
+    # CUDA_VISIBLE_DEVICES per worker, or explicit per-port GPU assignment)
+    # would let these passes run in parallel again, one GPU each. Future work,
+    # not yet implemented.
+    parallel, parallel_override = _passes_run_parallel(sim, n)
+    if parallel_override:
+        FreeCAD.Console.PrintWarning("Palace: WARNING — " + parallel_override + "\n")
 
     # Build per-pass tab labels
     if n == 1:
@@ -855,6 +922,8 @@ def _launch_passes(passes, needs_merge, console, sim, binary,
         console.clear_port_tabs()
         for i, label in labels.items():
             console.add_port_tab(i, label)
+        if parallel_override:
+            console.write("[Palace] WARNING — " + parallel_override + "\n")
         mode_str = "parallel" if parallel else "serial"
         console.write(
             f"[Palace] Starting {n} pass{'es' if n > 1 else ''} ({mode_str})…\n"

@@ -56,8 +56,24 @@ The `:cuda` image is built for a broad range of NVIDIA GPU generations
 solver) is not yet wired up — GPU runs use Palace's standard iterative
 solvers, just executed on the GPU.
 
-**Turn off "Run passes in parallel"** (Solver tab, Driven settings) for
-multi-port simulations with Device=GPU. `docker-compose.cuda.yml` requests
+**Parallelism settings are handled for you on GPU.** Selecting `GPU` as the
+**Device** sets **MPI processes** to 1, **OMP threads/rank** to 0, and unticks
+**Run passes in parallel**, with a note in the panel saying what changed —
+switching back to `CPU` restores your previous values. Every control stays
+editable, so a genuine multi-GPU machine can raise the rank count back up
+(use one rank per GPU). Multi-port passes are additionally forced to run
+serially at launch time whenever Device=GPU, regardless of the checkbox, and
+a warning names any remaining mismatch in the Report View and the Palace
+console before the solver starts.
+
+Why: MPI ranks scale a Palace run *across* GPUs, not within one. Ranks sharing
+a single device time-slice it rather than running concurrently, each one
+duplicates its own device-resident operators and CUDA context, and the `:cuda`
+image builds hypre without GPU-aware MPI, so every halo exchange per solver
+iteration copies through host memory. OMP threads have little to no effect
+when compute runs on the device.
+
+As for parallel passes specifically: `docker-compose.cuda.yml` requests
 all available GPUs with no per-pass device pinning, and each pass launches
 its own independent Palace/mpirun process — none of them are assigned to a
 particular GPU, so running several simultaneously means they all contend for

@@ -652,6 +652,81 @@ needed no changes at all — they only ever read `quality["is_bad"]` and pass
 the whole dict to `format_quality_warning()`, so only what causes the
 dialog to fire changed, not the dialog/blocking behavior itself.
 
+### GPU runs SIGFPE at FE order ≥ 2 — SLEPc's CUDA path, not memory — `palace/run_diagnosis.py`
+A `Device=GPU` run of a real board (`projects/Coax_Directional_Bridge.FCStd`,
+187,415 elements) dies with **signal 8 (SIGFPE)** immediately after Palace
+prints `Assembling multigrid hierarchy`. GPU memory is full at that moment
+(measured climbing 554 MiB → 7771 MiB during the run), which makes it look
+like an out-of-memory failure. **It is not.** On x86-64, SIGFPE is an
+*integer* divide-by-zero; floating-point operations produce inf/NaN instead
+of trapping.
+
+A gdb backtrace pins it exactly (registers at the fault: `rax = 1278924`,
+the ND p=2 unknown count, divided by `rbx = 0`):
+
+```
+BVMultInPlace_BLAS_CUDA  <- SLEPc, CUDA basis-vector path
+BVMultInPlace_Mat_CUDA
+EPSSolve_KrylovSchur_Default / SVDSolve_Cross
+palace::slepc::GetMaxSingularValue
+palace::GetLambdaMax
+palace::ChebyshevSmoother<ComplexOperator>::SetOperator
+palace::DistRelaxationSmoother<ComplexOperator>::SetOperators
+palace::GeometricMultigridSolver<ComplexOperator>::SetOperator
+```
+
+The Chebyshev smoother needs a largest-eigenvalue estimate, which Palace
+gets through SLEPc; on GPU that runs SLEPc's CUDA BV routines, which divide
+by zero here.
+
+**It takes a Chebyshev-smoothed level AND a large one — not merely order ≥ 2.**
+The smoother runs on the non-coarsest levels of the p-multigrid hierarchy,
+which only exists at FE order ≥ 2, but size decides whether it actually
+faults. Bisected against the same mesh, each varying exactly one thing:
+- **Order 1, GPU — works.** Single level, 246,279 unknowns. Ran to iteration
+  17/400 with sane S-parameters.
+- **Order 2, GPU, adaptive sweep — SIGFPE.** Two levels, 1,278,924 on the
+  smoothed level.
+- **Order 2, GPU, uniform sweep — SIGFPE**, same point. The adaptive/PROM
+  path is *not* implicated, despite appearing in the backtrace as the caller.
+- **Order 2, GPU, a 50x smaller model (`examples/Microstrip_test_new.FCStd`,
+  3,787 elements) — completes cleanly**, with the same two-level hierarchy
+  shape (27,016 on the smoothed level). Do not restate this bug as
+  "order ≥ 2 fails on GPU"; that was the first reading and testing a small
+  order-2 model disproved it.
+- `Solver.Linear.Type = "Jacobi"` — rejected by Palace itself before any
+  solve ("Unsupported linear solver type for boundary mode solver"), so it
+  is not an available route.
+- `PETSC_OPTIONS="-bv_type vecs"` / `"-bv_type svec"` — **ignored**, still
+  crashes. Palace sets the BV type internally, so the option never applies.
+- **`Solver.Linear.MGMaxLevels = 1`, Order 2, GPU — does NOT crash.** Ran the
+  full 420 s test window (exit 124 from `timeout`, not 136) with the
+  hierarchy collapsed to a single `Level 0 (p = 2)`. This localizes the
+  divide-by-zero to the presence of the **coarse p=1 level**, and is the
+  strongest evidence for what the zero divisor actually is. It is *not*
+  offered as a user workaround: a single-level hierarchy is a far weaker
+  preconditioner, and this run produced no solver iteration output at all in
+  420 s, versus order 1 reaching iteration 17/400 in ~440 s. The workbench
+  writes no `Linear` block at all (`palace/config.py:_build_solver`), so
+  reaching this setting needs a hand-edited config anyway.
+
+Do **not** re-diagnose a GPU SIGFPE as an out-of-memory problem. This is now
+a third distinct crash signature to keep apart from the two SIGBUS causes
+documented below (`/dev/shm` exhaustion; malformed boundary attributes) —
+all three look alike from outside, so `palace/run_diagnosis.py` matches on
+the signal number reported in mpirun's own output line (mpirun substitutes
+its own exit code for the child's, so `returncode` alone cannot tell them
+apart).
+
+**Shared GPU memory, measured** (WSL2, RTX 3060 Ti 8 GiB, driver 616.92,
+via `libcudart` directly): `cudaMalloc` of 12 GiB **succeeds** — allocated,
+written and synchronized, with `nvidia-smi` plateauing at ~7.8 GiB while the
+remainder came from WDDM shared system memory. `cudaMallocManaged` of the
+same size **fails** with `out of memory`. So plain device allocations spill
+into shared memory and managed ones cannot; this build's hypre is
+`HYPRE_USING_DEVICE_MEMORY` (unified memory `#undef`), so it is on the
+spillable path.
+
 ### `/dev/shm` cleanup for orphaned Open MPI `vader` segments — `palace/runner.py`, `palace/shm_cleanup.py`
 Open MPI's `vader` BTL (its shared-memory transport for intra-node inter-rank
 communication) creates one file per rank in `/dev/shm`, named

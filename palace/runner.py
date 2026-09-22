@@ -20,6 +20,7 @@ import subprocess
 import sys
 import FreeCAD
 
+from palace.gpu_memory import log_gpu_memory
 from palace.shm_cleanup import cleanup_stale_shm_segments, warn_if_shm_full
 
 _CUDA_SENTINEL_NAME = "palace-cuda-enabled"
@@ -89,6 +90,41 @@ def _check_gpu_requested(config_path, binary_path, path_exists=os.path.isfile):
     )
 
 
+def _gpu_parallelism_warnings(device, num_procs, num_threads):
+    """Advisory messages for a GPU run configured like a CPU run.
+
+    MPI ranks are how Palace scales *across* GPUs, not how it extracts more
+    speed from one: ranks sharing a single device time-slice rather than
+    overlap (no CUDA MPS here), each rank duplicates device-resident operators
+    plus its own CUDA context, and this project's CUDA image builds hypre
+    without GPU-aware MPI (HYPRE_USING_GPU_AWARE_MPI undefined), so every halo
+    exchange per solver iteration round-trips device->host->device.
+
+    Pure (no I/O, no FreeCAD) so it is unit-testable the same way
+    _check_gpu_requested is -- run_palace() reads Solver.Device itself and
+    passes the result in.
+    """
+    if device != "GPU":
+        return []
+    msgs = []
+    if num_procs > 1:
+        msgs.append(
+            f"Palace: WARNING — Device=GPU with {num_procs} MPI processes. On a "
+            "GPU build, use one rank per GPU, not one per CPU core: ranks "
+            "sharing a single device time-slice it rather than running "
+            "concurrently, each rank duplicates GPU memory, and this build has "
+            "no GPU-aware MPI (every halo exchange copies through host memory). "
+            "Set MPI processes to 1 unless you have one GPU per rank."
+        )
+    if num_threads > 0:
+        msgs.append(
+            f"Palace: WARNING — Device=GPU with {num_threads} OpenMP threads per "
+            "rank. Compute runs on the device, so OMP threads/rank have little "
+            "to no effect on a GPU run; 0 is the appropriate setting."
+        )
+    return msgs
+
+
 def _wsl_path_exists(path):
     """Check for a file inside the WSL filesystem from native Windows Python.
 
@@ -143,13 +179,13 @@ def run_palace(config_path, binary_path, num_procs=1, num_threads=0,
     if not os.path.isfile(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    def _shm_log(msg):
+    def _log(msg):
         text = msg if msg.endswith("\n") else msg + "\n"
         FreeCAD.Console.PrintMessage(text)
         if line_callback is not None:
             line_callback(text)
 
-    def _shm_warn(msg):
+    def _warn(msg):
         text = msg if msg.endswith("\n") else msg + "\n"
         FreeCAD.Console.PrintWarning(text)
         if line_callback is not None:
@@ -161,8 +197,15 @@ def run_palace(config_path, binary_path, num_procs=1, num_threads=0,
     # incident: see CLAUDE.md's "/dev/shm cleanup for orphaned Open MPI
     # vader segments" invariant). No-ops harmlessly where /dev/shm doesn't
     # exist (e.g. this process running natively on Windows for the WSL path).
-    cleanup_stale_shm_segments(log_fn=_shm_log)
-    warn_if_shm_full(log_fn=_shm_warn)
+    cleanup_stale_shm_segments(log_fn=_log)
+    warn_if_shm_full(log_fn=_warn)
+
+    # A GPU run that later dies raises the obvious question of whether it
+    # simply ran out of device memory -- record the answer up front, while
+    # the process that would hold those allocations still exists. CPU runs
+    # skip this entirely rather than shelling out to nvidia-smi for nothing.
+    if _requested_device(config_path) == "GPU":
+        log_gpu_memory(_log, warn_fn=_warn)
 
     on_windows = sys.platform == "win32"
     use_wsl = on_windows and _is_wsl_path(binary_path)
@@ -206,6 +249,14 @@ def run_palace(config_path, binary_path, num_procs=1, num_threads=0,
         _check_gpu_requested(config_path, binary_path)
         cmd = [binary_path] + palace_args + [config_path]
         cwd = os.path.dirname(config_path)
+
+    # Emitted only after the branch above, so _check_gpu_requested() has already
+    # run on whichever launch path was taken -- performance advice must never
+    # precede the hard "this build has no CUDA support" failure.
+    for msg in _gpu_parallelism_warnings(
+        _requested_device(config_path), num_procs, num_threads
+    ):
+        _warn(msg)
 
     FreeCAD.Console.PrintMessage(f"Palace: Running: {' '.join(cmd)}\n")
 

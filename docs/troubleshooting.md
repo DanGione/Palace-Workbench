@@ -157,6 +157,48 @@ Verify with `docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04
 nvidia-smi` on the host before troubleshooting further inside this
 workbench's container.
 
+**GPU run dies with "Floating point exception" (signal 8) after "Assembling multigrid hierarchy"**
+
+This is **not** an out-of-memory failure, even though GPU memory is typically
+full when it happens. Signal 8 on x86-64 is an integer divide-by-zero. A gdb
+backtrace places it in SLEPc's CUDA basis-vector routine
+(`BVMultInPlace_BLAS_CUDA`), reached from the Chebyshev smoother's
+largest-eigenvalue estimate while Palace sets up its p-multigrid hierarchy.
+
+It needs two things together: a multi-level hierarchy (which only exists at
+**FE order 2 and above**), and a **large** problem. Measured on this build:
+
+| run | hierarchy | result |
+|---|---|---|
+| `Coax_Directional_Bridge`, order 1 | single level, 246,279 unknowns | runs |
+| `Coax_Directional_Bridge`, order 2 | two levels, 1,278,924 on the smoothed level | **crashes** |
+| `Microstrip_test_new`, order 2 | two levels, 27,016 on the smoothed level | runs |
+
+So small models are fine on GPU at any order — this bites large ones. Both
+the adaptive and the uniform frequency sweep crash identically, so the
+sweep type is not involved.
+
+If you hit it, drop to **FE order 1** (verified to run the large model to
+completion on GPU) or switch to **Device = CPU** for order 2 and above. The
+run panel names this cause itself when the crash happens.
+
+**Does a GPU run use Windows' "Shared GPU Memory"?**
+
+Partly, and not in the way the Task Manager display suggests. Measured on
+WSL2 (RTX 3060 Ti, 8 GiB, driver 616.92) by calling CUDA directly:
+
+| allocation type | 12 GiB requested on the 8 GiB card |
+|---|---|
+| `cudaMalloc` (plain device memory) | **succeeded** — allocated, written and synchronized, with `nvidia-smi` plateauing at ~7.8 GiB while the rest came from shared system memory |
+| `cudaMallocManaged` (unified memory) | **failed** — `out of memory` |
+
+So plain device allocations *do* spill into shared GPU memory, which is why
+a run can keep going past the point where dedicated memory looks exhausted.
+CUDA managed allocations cannot spill — that is a documented WSL2
+limitation — and fail hard at the physical limit. Spilled memory is backed
+by host RAM and is far slower than real VRAM, so a run that relies on it
+heavily may appear to hang.
+
 ---
 
 ## Results
