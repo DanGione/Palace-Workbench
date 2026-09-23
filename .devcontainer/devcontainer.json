@@ -1,9 +1,15 @@
 {
   "name": "Empire Simulator",
   "build": {
+    // CPU build (default). For the CUDA-accelerated variant, switch this to
+    // "Dockerfile.cuda" and uncomment the "runArgs" line below -- see
+    // CLAUDE.md's "Multi-rank CPU is broken in the CUDA-enabled build" entry
+    // before doing so: that image is single-rank-only in practice, not a
+    // general-purpose replacement for this one.
     "dockerfile": "Dockerfile",
     "context": ".."
   },
+  // "runArgs": ["--gpus=all"],  // required when using Dockerfile.cuda above
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
   "workspaceFolder": "/workspace",
   "remoteUser": "vscode",

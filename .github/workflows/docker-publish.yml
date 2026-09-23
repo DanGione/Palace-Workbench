@@ -78,6 +78,27 @@ jobs:
   # the "main" branch/ref specifically — the raw `latest-cuda` tag (matching
   # the CPU image's `latest` behavior) only gets produced when github.ref is
   # refs/heads/main, same rule as the CPU job's own `latest` tag below.
+  #
+  # Real-hardware validation update (2026-09): order-1 GPU runs and cuDSS
+  # (Solver.Linear.Type="cuDSS") both confirmed working end-to-end on real
+  # NVIDIA hardware — see CLAUDE.md's "NVIDIA cuDSS sparse direct solver"
+  # entry. This is NOT the "proven working" signal to remove the gate on,
+  # though: the same build was also found to deadlock on ANY multi-rank CPU
+  # run (mpirun -n 2+, even with Device=CPU) — confirmed via live backtrace
+  # stuck in hypre_ParCSRCommPkgCreateApart/hypre_DataExchangeList, and
+  # confirmed NOT reproducing on the plain (this job's) CPU image built from
+  # the same host/Open MPI version. Root cause not fully pinned down (leading
+  # suspect: this build's HYPRE_USING_CUDA/HYPRE_USING_DEVICE_MEMORY hypre
+  # compile flags change how hypre allocates its MPI communication buffers,
+  # even on a CPU-only run) — full writeup in CLAUDE.md's "Multi-rank CPU is
+  # broken in the CUDA-enabled build" entry. Also unaffected either way: FE
+  # order >= 2 on GPU still SIGFPEs (see CLAUDE.md's "GPU runs SIGFPE at FE
+  # order >= 2" entry), deliberately left unpatched. Net effect: this image
+  # is single-rank-only in practice (GPU order-1 work and cuDSS only), not a
+  # general-purpose drop-in for the CPU image above. Before removing this
+  # gate, either fix the multi-rank hang or make sure downstream users of
+  # this tag understand the single-rank limitation — don't just promote it
+  # to the automatic push/tag path because the compile+smoke-test now works.
   # ============================================================================
   build-and-push-cuda:
     # Compared with `== 'true'` rather than used bare: workflow_dispatch

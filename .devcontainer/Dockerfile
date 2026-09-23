@@ -71,10 +71,19 @@ RUN pip install --no-cache-dir gmsh netgen-mesher numpy scipy cmake matplotlib x
 # dependencies (MFEM, HYPRE, libCEED, SuperLU_DIST, nlohmann/json, fmt, …).
 # Only system-level MPI, BLAS/LAPACK, and zlib are consumed from the OS.
 # The source tree is deleted after installation to keep the image lean.
-# Pinned to v0.17.0 (latest tagged release as of writing) instead of tracking
+# Pinned to v0.18.1 (latest tagged release as of writing) instead of tracking
 # main — an unpinned clone silently picks up whatever's newest upstream on
 # every image rebuild, making builds non-reproducible and liable to break.
-RUN git clone --depth=1 --branch v0.17.0 https://github.com/awslabs/palace.git /tmp/palace-src \
+# Bumped from v0.17.0 to match the root Dockerfile's CPU path and pick up
+# 0.18.x's wave-port/schema fixes -- see CLAUDE.md's "Palace version bumped"
+# entry.
+#
+# CPU-only build. For the CUDA-accelerated variant (GPU order-1 work and
+# cuDSS experimentation -- NOT a general-purpose replacement for this file,
+# see CLAUDE.md's "Multi-rank CPU is broken in the CUDA-enabled build" entry
+# for why), use Dockerfile.cuda instead: point devcontainer.json's
+# "build.dockerfile" at "Dockerfile.cuda" and uncomment its "runArgs" line.
+RUN git clone --depth=1 --branch v0.18.1 https://github.com/awslabs/palace.git /tmp/palace-src \
     && cmake -S /tmp/palace-src -B /tmp/palace-src/build \
              -DCMAKE_BUILD_TYPE=Release \
              -DCMAKE_INSTALL_PREFIX=/usr/local \
