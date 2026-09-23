@@ -66,17 +66,25 @@ def _gpu_run(output_lines):
 
 
 _SIGFPE_GPU = (
-    "Palace died with SIGFPE (signal 8): an integer divide-by-zero inside "
-    "SLEPc's CUDA basis-vector routine (BVMultInPlace_BLAS_CUDA), confirmed "
-    "by a gdb backtrace.\n"
+    "Palace died with SIGFPE (signal 8): a modulo-by-zero inside SLEPc's "
+    "CUDA basis-vector routine (BVMultInPlace_BLAS_CUDA), confirmed by "
+    "reading SLEPc v3.24.1's own source. That function sizes a memory-limited "
+    "batch as freemem/(m*sizeof(PetscScalar)) -- appears to divide by the "
+    "wrong dimension (m, the large operator size, instead of n, the small "
+    "vector count) -- which can floor to 0 for a large operator, then faults "
+    "on an unguarded `m % bs` two lines later. This is a genuine upstream "
+    "SLEPc bug, present unchanged in Palace v0.17.0 and v0.18.1 alike (the "
+    "0.18.0 changelog's \"fixed smoother spectral estimates\" entry, PR #837, "
+    "does not touch this code path).\n"
     "It faults during the Chebyshev smoother's largest-eigenvalue estimate, "
     "which runs on the non-coarsest levels of Palace's p-multigrid "
-    "hierarchy — levels that exist at FE order 2 and above — and it takes a "
+    "hierarchy -- levels that exist at FE order 2 and above -- and it takes a "
     "large one to trigger: measured here, a smoothed level of 1,278,924 "
     "unknowns faults while one of 27,016 completes.\n"
     "What to do: drop to FE order 1 (verified to run this same large model "
-    "to completion on GPU), or use Device=CPU at order 2 and above. Smaller "
-    "models run as they are."
+    "to completion on GPU, and stays well under GPU memory limits -- ~4 GiB "
+    "peak measured here on an 8 GiB card, vs. order 2's ~7.8 GiB), or use "
+    "Device=CPU at order 2 and above. Smaller models run as they are."
 )
 
 _SIGFPE_CPU = (

@@ -159,11 +159,30 @@ workbench's container.
 
 **GPU run dies with "Floating point exception" (signal 8) after "Assembling multigrid hierarchy"**
 
-This is **not** an out-of-memory failure, even though GPU memory is typically
-full when it happens. Signal 8 on x86-64 is an integer divide-by-zero. A gdb
-backtrace places it in SLEPc's CUDA basis-vector routine
-(`BVMultInPlace_BLAS_CUDA`), reached from the Chebyshev smoother's
-largest-eigenvalue estimate while Palace sets up its p-multigrid hierarchy.
+This is **not** an out-of-memory failure in the usual sense, even though GPU
+memory is typically near-full when it happens (more on that below). Signal 8
+on x86-64 is an integer divide (or modulo) by zero. A gdb backtrace places it
+in SLEPc's CUDA basis-vector routine (`BVMultInPlace_BLAS_CUDA`), reached
+from the Chebyshev smoother's largest-eigenvalue estimate while Palace sets
+up its p-multigrid hierarchy.
+
+**Root cause, confirmed against SLEPc's own source** (v3.24.1, the exact
+version Palace pins — cloned directly and read, not inferred): that function
+checks `cudaMemGetInfo()` for free GPU memory before computing a large
+matrix product. If there isn't enough to do the whole thing at once, it
+falls back to computing the work in batches, sized as
+`freemem/(m*sizeof(PetscScalar))` where `m` is the operator size (our large
+model's smoothed multigrid level, ~1.28M unknowns) — this divides by `m`,
+the huge dimension, rather than `n`, the small number of vectors actually
+being multiplied, which looks like the real bug: for a large `m` this
+collapses to 0 well before free memory is actually exhausted. Two lines
+later, that batch size is used as a modulo divisor (`m % bs`) with no check
+that it's nonzero. This is a genuine upstream SLEPc bug, not anything
+particular to this workbench or Docker image, and is present unchanged in
+Palace v0.18.1 as well as v0.17.0 (confirmed: PR #837, credited in the 0.18.0
+changelog as "fixed smoother spectral estimates," only touches a different,
+already-safe branch — the crashing complex-operator branch is untouched by
+that fix).
 
 It needs two things together: a multi-level hierarchy (which only exists at
 **FE order 2 and above**), and a **large** problem. Measured on this build:
@@ -182,6 +201,39 @@ If you hit it, drop to **FE order 1** (verified to run the large model to
 completion on GPU) or switch to **Device = CPU** for order 2 and above. The
 run panel names this cause itself when the crash happens.
 
+We deliberately did not patch this ourselves — it would mean carrying a
+source patch against Palace/SLEPc indefinitely for a bug that isn't ours,
+and a CPU-only-PETSc/SLEPc workaround was tried and abandoned when it hit a
+*second*, deliberate upstream guard (`palace/linalg/petsc.hpp`'s
+`#error "Mismatch between MFEM and PETSc CUDA support!"`) that would have
+needed patching too. Order 1 GPU never reaches this code path at all (a
+single-level hierarchy has no Chebyshev smoother to set up) and stays
+comfortably within memory budget regardless of model size — see the memory
+table below. For a model that genuinely needs order 2, GPU's actual biggest
+win on real sweeps is wave-port re-solving (recomputed once per output
+frequency, ~89% of a realistic sweep's wall clock) rather than the main 3-D
+solve this bug lives in — see cuDSS below for that path.
+
+**How much GPU memory does a run actually need?**
+
+Measured on the same real board (`Coax_Directional_Bridge`, 187,415
+elements) on an 8 GiB RTX 3060 Ti:
+
+| config | peak GPU memory |
+|---|---|
+| Order 1, GPU | **~4.0 GiB** — comfortable margin, roughly half the card |
+| Order 1, CPU | ~4.7 GiB (host RAM) |
+| Order 2, GPU | **~7.8 GiB / 8 GiB** — right before the SIGFPE above |
+
+Order 1 GPU has real headroom on an 8 GiB card and isn't "just barely"
+fitting — order 2's much larger multigrid hierarchy (roughly 5× the
+unknowns on the smoothed level for this same mesh) is what pushes memory to
+the edge, and that's directly why it's the one that trips the SLEPc bug
+above: that bug only manifests when free GPU memory is actually low at the
+moment it's checked. If your model's CPU memory usage is well over ~6-7
+GiB, expect order 2 on an 8 GiB card to be tight regardless of whether the
+SIGFPE specifically hits.
+
 **Does a GPU run use Windows' "Shared GPU Memory"?**
 
 Partly, and not in the way the Task Manager display suggests. Measured on
@@ -197,7 +249,11 @@ a run can keep going past the point where dedicated memory looks exhausted.
 CUDA managed allocations cannot spill — that is a documented WSL2
 limitation — and fail hard at the physical limit. Spilled memory is backed
 by host RAM and is far slower than real VRAM, so a run that relies on it
-heavily may appear to hang.
+heavily may appear to hang. Not every allocation in Palace's GPU pipeline
+has been individually confirmed to use the spillable path — hypre (the bulk
+of the algebraic multigrid work) is confirmed on it, but this hasn't been
+checked for every library in the chain, so treat "12 GiB worked once" as
+encouraging, not a guarantee that a specific large model will fit.
 
 ---
 

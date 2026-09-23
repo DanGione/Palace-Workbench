@@ -21,5 +21,7 @@ Splitter.FCStd
 smd_prototype.FCStd
 BUGFIX_PLAN.md
 SMD_COMPONENT_GUI_PLAN.md
+GPU_TESTING_PLAN.md
+.devcontainer/README.md
 .DS_Store
 Thumbs.db

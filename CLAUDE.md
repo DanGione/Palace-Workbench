@@ -727,6 +727,333 @@ into shared memory and managed ones cannot; this build's hypre is
 `HYPRE_USING_DEVICE_MEMORY` (unified memory `#undef`), so it is on the
 spillable path.
 
+**Exact root cause, confirmed against real SLEPc source (not inferred) —
+and the decision not to patch it.** `git clone --branch v3.24.1
+https://gitlab.com/slepc/slepc.git` (the exact tag Palace's superbuild
+pins) and read `src/sys/classes/bv/impls/cuda/bvcuda.cu` directly.
+`BVMultInPlace_BLAS_CUDA` checks `cudaMemGetInfo()`; when free GPU memory
+can't hold the whole result matrix at once, it computes a fallback batch
+size as `freemem/(m*sizeof(PetscScalar))` where `m` is the operator size
+(`V->n`, our crashing level's ~1.28M unknowns) — dividing by `m`, the huge
+dimension, rather than `n`, the small vector count actually being
+multiplied (the same `d_work` buffer is sized `bs*n*sizeof(PetscScalar)`,
+so the memory-correct divisor is `n`, not `m`) — collapses to 0 in integer
+division once `m` is large relative to free memory, and two lines later
+`PetscCall(PetscCuBLASIntCast(m % bs,&l))` — `m % bs` — modulo-by-zero,
+SIGFPE. Exactly matches the gdb registers (`rax=1278924`=`m`,
+`rbx=0`=`bs`). Confirmed still present, unchanged, at Palace v0.18.1 (see
+the version-bump entry below) — this is a real upstream SLEPc bug, not
+something introduced by this project or fixed by the version most recently
+adopted here.
+
+A defensive `bs` floor (e.g. clamp to ≥ 1) was considered and rejected: with
+`m≈1.28M` and `bs=1`, the surrounding loop (`for (;l<m;l+=bs)`) would run
+**1.28 million** individual tiny `cublasXgemm`/`cudaMemcpy2D` calls — avoids
+the crash but turns a sub-second operation into something that could
+plausibly take hours, the same "technically survives, practically unusable"
+failure mode already documented above for `MGMaxLevels=1`. Fixing the
+apparent `m`-vs-`n` divisor mismatch properly would avoid both problems, but
+that's a real SLEPc source patch either way.
+
+**Decision: don't patch Palace/PETSc/SLEPc source to work around this.**
+Two routes were investigated and both carry real cost:
+- A CPU-only PETSc/SLEPc build (MFEM/hypre/libCEED keep CUDA) was actually
+  built and compiled successfully — two source patches applied
+  (`extern/CMakeLists.txt`'s `include(ExternalSLEPc)` wrapped to
+  save/force-OFF/restore `PALACE_WITH_CUDA` around just that include, since
+  the file `include()`s every dependency unscoped and SLEPc's own include
+  precedes hypre/libCEED/MFEM in file order; `palace/linalg/slepc.cpp`'s
+  `PetscVecType()` patched to never select `VECCUDA`, since it reads MFEM's
+  runtime device state rather than PETSc's own compile-time CUDA support) —
+  but then hit a **second**, deliberate upstream guard:
+  `palace/linalg/petsc.hpp:23-32` has an explicit
+  `#error "Mismatch between MFEM and PETSc CUDA support!"` when
+  `MFEM_USE_CUDA`/`PETSC_HAVE_CUDA` disagree, forbidding exactly this split
+  configuration. Patching a defensive guard the Palace maintainers put there
+  on purpose, on top of an already-two-patch workaround, felt like
+  compounding risk rather than resolving it, so this was abandoned.
+- Hand-deriving a fix for `GetLambdaMax`'s complex-operator branch (mirror
+  PR #837's Hermitian-similarity-transform fix for the real-operator branch)
+  was also considered and rejected — getting that math wrong produces
+  silently-*incorrect* eigenvalues instead of a crash, a worse failure mode,
+  and Palace's own maintainers are better positioned to write and validate
+  that than we are.
+
+**What we did instead: stay on GPU at order 1 (which never reaches this
+code path — a single-level hierarchy has no Chebyshev smoother to set up),
+and add cuDSS for the workload that actually dominates a real sweep.**
+Order 1 GPU also has real memory headroom, not a near-miss: measured ~4.0
+GiB peak on this same large board on the 8 GiB card, vs. order 2's ~7.8 GiB
+right before the crash above — order 2 on a model this size is genuinely
+memory-constrained on this hardware regardless of the SLEPc bug, since this
+model's CPU-side memory usage (~12 GiB) already exceeds the card's 8 GiB
+VRAM outright. See "NVIDIA cuDSS sparse direct solver" below.
+
+### Palace version bumped v0.17.0 → v0.18.1 — both Dockerfiles
+Bumped to chase the SIGFPE above (§4b of `PALACE_CUDA_ORDER2_HANDOFF.md`
+hoped PR #837 fixed it outright) and to unlock cuDSS (below), which doesn't
+exist as a build option before v0.18.0. The version bump did **not** fix
+the SIGFPE (see above) but was kept anyway: 0.18.x's other changes are
+independently worth it here — wave-port fixes matching this project's
+geometry (0.18.0 PR 778 fixed 2-D mode eigensolver crashes with waveports +
+non-zero conductivity, both present on these boards; 0.18.1 PR 921 improved
+BoundaryMode convergence with lossy BCs), and performance work on the
+wave-port-dominated bottleneck (0.18.0 PR 824/825 move boundary
+postprocessing/field eval onto libCEED/GPU; 0.18.1 reduces repeated
+complex-operator/PROM work and buffers adaptive-sweep CSV writes). The
+`cmake/ExternalPalace.cmake` `sed` patch (`CMAKE_CUDA_HOST_COMPILER`
+forwarding) needed no changes — confirmed byte-identical target line at
+both tags. Known, not-yet-validated behavior changes from this bump, flagged
+for whoever next touches wave-port results: per-port `MaxIts`/`KSPTol`
+(`palace/config.py` ~166-169) go from silently-ignored to actually-effective
+(0.18.1 PR 921); some passive lumped-port `port-S.csv`/`port-V.csv`/
+`port-I.csv` values change from identically-zero to finite (0.18.0 PR 841);
+a modal correction changes wave-port S-parameters for TM/hybrid modes only
+(0.18.1 PR 886 — TEM/TE, i.e. coax, explicitly unaffected). None of these
+have been diffed against a known-good 0.17.0 result yet.
+
+### NVIDIA cuDSS sparse direct solver — `Dockerfile`, `.devcontainer/Dockerfile`
+Added instead of chasing the SIGFPE above. `Solver.Linear.Type: "cuDSS"`
+(Palace 0.18.0 PR 717) is a GPU-resident direct solver — confirmed via
+config schema it applies only to `Solver.Linear.Type` (the main 3-D system
+solve), not a separate wave-port-specific setting. **Does not avoid the
+SIGFPE**: tested directly (before adding cuDSS) by setting
+`Solver.Linear.Type = "SuperLU"` — already built into the image, a direct
+solver in the same category as cuDSS — against the same order-2 crashing
+config; it still crashed identically. `Solver.Linear.Type` only chooses the
+*coarse-level* solver within Palace's multigrid hierarchy; the
+intermediate-level Chebyshev smoother (where the actual bug lives) runs
+regardless of that choice. cuDSS is valuable purely on performance
+grounds: wave-port boundary modes are recomputed once per output frequency
+and dominate a realistic sweep's wall clock (~89% of it, per
+`PALACE_CUDA_ORDER2_HANDOFF.md`'s timing breakdown) — targeting that is
+independent of, and unaffected by, the order-2 SIGFPE question.
+
+**Verified working at runtime, not just at build time.** Ran a real,
+full-scale order-1 GPU solve (`Coax_Directional_Bridge.FCStd`, all 400/400
+sweep points, `Solver.Linear.Type: "cuDSS"`) to completion: exit 0,
+physically sane S-parameters throughout, full Elapsed Time Report. This
+also independently reconfirms the wave-port bottleneck at real scale, not
+just the earlier 3-point sample: **Wave Ports timer read 4182.6s of
+4960.3s total (~84%)**, in line with the ~89% figure `PALACE_CUDA_ORDER2_HANDOFF.md`
+measured on a 3-point sweep. Not yet measured: a direct A/B comparison
+against the same run with `Solver.Linear.Type` at its default — this run
+confirms cuDSS is *functionally correct* on real hardware, not that it's
+*faster* than the default solver for this workload. That comparison is a
+real next step, not done here.
+
+**Confirmed cuDSS is genuinely engaged for both the main solve and the
+wave-port boundary-mode solve, not silently inert or falling back to
+something else** — two independent lines of evidence, not just "it didn't
+crash":
+- **Source-level** (`palace/linalg/ksp.cpp`, `palace/models/modeeigensolver.cpp`,
+  both read directly from a real v0.18.1 clone): `ModeEigenSolver::SetUpLinearSolver`
+  does `LinearSolver pc_type = linear.type;` — our config's
+  `Solver.Linear.Type` seeds `pc_type` directly. A fallback chain exists
+  that would otherwise prefer SuperLU_DIST (built by default) over cuDSS,
+  but it only fires `if (pc_type == LinearSolver::DEFAULT || ... AMS ||
+  ... BOOMER_AMG)` — since our config sets it explicitly, that chain is
+  skipped entirely and a real `CuDSSSolver` gets constructed, confirmed in
+  both the main-solve dispatch and the wave-port module.
+- **Empirical, contrastive**: ran the *identical* config/board against
+  last night's non-cuDSS image (`palace-workbench:cuda-018`, same v0.18.1,
+  built without `PALACE_WITH_CUDSS`). It failed immediately, before
+  mesh/solve even started: `Verification failed: (solver.linear.type !=
+  LinearSolver::CUDSS) is false: --> Linear solver cuDSS requested but
+  Palace was not built with cuDSS support!`. If the cuDSS-enabled image's
+  selection logic were silently falling back to something else, this
+  cuDSS-specific up-front check wouldn't exist to fail on in the first
+  place — the contrast between "hard fails immediately" (no cuDSS build)
+  and "runs 400/400 points successfully" (cuDSS build) is direct proof the
+  build, not just the config, is what's different.
+
+Still genuinely open: whether cuDSS is *faster* than the default solver
+here, and how much of the wave-port bottleneck is linear-solve time (where
+cuDSS could help) versus per-frequency operator assembly/reprojection
+(structurally outside what any direct solver can speed up, being assembly
+work rather than a linear solve) — unmeasured, flagged as unresolved back
+in `PALACE_CUDA_ORDER2_HANDOFF.md` §8 before cuDSS even existed as an
+option here.
+
+Not bundled in the CUDA Toolkit base image and not pip/conda-installable
+for this purpose — Palace's own docs require `CUDSS_DIR` to point at a real
+NVIDIA cuDSS *archive* install. Both Dockerfiles download it directly from
+NVIDIA's redistributable manifest
+(`developer.download.nvidia.com/compute/cudss/redist/redistrib_0.7.1.json`)
+rather than a guessed URL: cuDSS **0.7.1.4**, the CUDA 12 Linux x86_64
+build, extracted to `/opt/cudss` and passed as `-DCUDSS_DIR=/opt/cudss
+-DPALACE_WITH_CUDSS=${PALACE_WITH_CUDSS}` (root `Dockerfile`; the
+devcontainer hardcodes it on, matching its existing no-ARG pattern for
+CUDA). Palace's own PR #826 (its cuDSS integration) notes cuDSS's MPI
+communication plugin is compiled from source against whichever MPI Palace
+itself uses, and NVIDIA only ships a prebuilt Open MPI binary — this
+project's images already use Open MPI (`libopenmpi-dev`/`openmpi-bin`), so
+this is a non-issue here, confirmed in a real build log (`cudss_commlayer_mpi`
+built and linked clean).
+
+**Pinned to 0.7.1, not the newest 0.8.0 release — a real build against
+0.8.0.10 failed, root-caused rather than just avoided.** 15 compile errors
+in `extern/mfem/linalg/cudss.cpp` ("too few arguments in function call" for
+`cudssMatrixCreateCsr`/`cudssMatrixCreateDn`). Palace vendors cuDSS support
+into MFEM itself via its own patch (`cmake/ExternalMFEM.cmake` downloads
+`extern/patch/mfem/mfem_pr5124_cudss.diff` at build time, backporting
+MFEM's own still-*unmerged* upstream PR #5124 — confirmed MFEM's pinned
+commit, `d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec` (the `mfem-4.9` release),
+has zero files matching `*cudss*` anywhere in a real clone of it). That
+vendored patch calls `cudssMatrixCreateCsr` with a single combined
+index-type argument (`CUDA_R_32I`) — a 13-argument signature. cuDSS 0.8.0
+changed this function to take two separate index-type arguments (14 args)
+— confirmed by reading MFEM's own upstream `master` branch, which already
+handles the split via `#if CUDSS_VERSION >= 800`, a check the older
+vendored PR #5124 patch has no equivalent of. 0.7.1.4 is the newest cuDSS
+release before that breaking change (confirmed against NVIDIA's own
+redistributable manifest, which lists 0.7.1 immediately below 0.8.0). If
+Palace ever updates its own vendored patch (or MFEM merges PR #5124
+upstream with 0.8.0-compatible code), this pin should be revisited —
+don't assume 0.7.1 stays correct indefinitely.
+
+**Licensing is genuinely unresolved, and `PALACE_WITH_CUDSS` defaults OFF
+in the root `Dockerfile` specifically because of it.** Unlike the CUDA
+Toolkit math libraries already in this image (cuBLAS/cuSPARSE/cuSOLVER/etc.,
+which have an explicit "Attachment A" redistributable-components list in
+the CUDA EULA), cuDSS's own separate license agreement has no equivalent
+list — it falls under general "distribute... binary files... as
+incorporated into a software application" language, which plausibly covers
+a real application like this one but is not a confirmed legal reading (not
+reviewed by counsel or NVIDIA as of this writing). This project's own
+license (MIT, permissive) doesn't trigger cuDSS's separate
+can't-become-subject-to-an-open-source-license clause, which at least rules
+out one specific concern. Do not flip `PALACE_WITH_CUDSS` on by default, or
+publish a cuDSS-enabled image to GHCR, without treating that as its own
+deliberate decision — local builds and testing only until resolved.
+
+**Workbench-side gap, not yet closed:** `palace/config.py` writes no
+`Solver.Linear` block at all (same `_build_solver` note as the
+`MGMaxLevels` discussion above), so there is currently no way to select
+`Solver.Linear.Type = "cuDSS"` from the GUI — only via a hand-edited config,
+the same way the SIGFPE reproduction and the `SuperLU` test above were run.
+Exposing it (a property + panel control + `config.py` write) is a real,
+separate piece of work, not done as part of this entry.
+
+### Umpire inside MFEM may be a real GPU adaptive-sweep bottleneck — researched, NOT applied
+Surfaced from a real upstream report, not our own profiling:
+[awslabs/palace#375](https://github.com/awslabs/palace/issues/375) ("Improve
+GPU performance for adaptive sweep wave ports", open, unresolved) measured a
+CPW board's adaptive wave-port sweep taking **11m24.7s on GPU vs. 1m35.1s
+for the same board's non-adaptive case** — roughly 7x, and directly in the
+same wave-port-re-solve hot path `PALACE_CUDA_ORDER2_HANDOFF.md`'s own §8
+measured as ~89% of a real sweep's wall clock. A maintainer's follow-up
+comment on that issue profiled it further: overhead traced to Umpire's
+memory management inside `mfem::LinearForm::Assemble()`, and disabling
+Umpire in MFEM measured **~6x faster** on the profiled hot function
+(`MeasureAndPrintAll`), with GPU computation still correct. That comment
+explicitly asks other contributors to verify the finding — it has not been
+independently confirmed even upstream, and the issue remains open as of
+Palace v0.18.1 (no linked PR).
+
+Cross-referenced against MFEM's own issue
+[mfem/mfem#5122](https://github.com/mfem/mfem/issues/5122) (closed, a
+*different* symptom — ParaView output slowdown from Umpire host-allocation
+overhead in `GridFunction::GetVectorValues`, not assembly) — same
+underlying cause (Umpire's host-side allocation overhead), different call
+site. MFEM maintainer v-dobrev's guidance there: **build hypre with Umpire,
+MFEM without** — hypre benefits from Umpire's GPU memory pooling, MFEM's
+own host-side allocations don't need it and pay for it anyway.
+
+**Confirmed via Palace's own v0.18.1 CMake source that this split isn't
+achievable with a build flag alone.** `PALACE_WITH_UMPIRE` isn't a
+user-facing cache option — `CMakeLists.txt` hardcodes it: `if(PALACE_WITH_CUDA
+OR PALACE_WITH_HIP) set(PALACE_WITH_UMPIRE ON) else() ... OFF endif()`, a
+plain (non-cache) `set()` that overrides any `-D` passed on the command
+line for as long as CUDA is on. `cmake/ExternalMFEM.cmake` then gates BOTH
+Umpire being added to `MFEM_DEPENDENCIES` (build ordering — harmless either
+way) AND the actual `-DMFEM_USE_UMPIRE=YES` MFEM build flag (the one that
+matters) behind that same single `PALACE_WITH_UMPIRE` switch — there's no
+independent toggle for "hypre gets Umpire, MFEM doesn't" as the code
+stands. Achieving v-dobrev's recommended split would need a targeted sed
+patch in the Dockerfile forcing `-DMFEM_USE_UMPIRE=NO` specifically in
+`ExternalMFEM.cmake`'s options list, leaving `PALACE_WITH_UMPIRE`/hypre's
+own Umpire usage untouched.
+
+**Deliberately not applied tonight.** Different scope from the cuDSS work
+above (a sweep-performance lever, not something blocking a working build),
+unverified even by its own reporter, and — like the abandoned §5 CPU-only
+PETSc/SLEPc attempt — would mean carrying yet another source patch, on the
+same night source patches were specifically being avoided in favor of
+cuDSS. Worth real testing before committing to it: measure the same
+adaptive wave-port sweep with and without `-DMFEM_USE_UMPIRE=NO` on real
+hardware first.
+
+### Multi-rank CPU is broken in the CUDA-enabled build — devcontainer stays on the plain (non-CUDA) image for now
+`mpirun -n 2` (and `-n 4`) hangs on `Device=CPU` in the CUDA-enabled image
+(`palace-workbench:cuda-018-cudss`), confirmed via a live `gdb`/`cuda-gdb`
+backtrace, not just a timeout:
+
+```
+PMPI_Iprobe → hypre_DataExchangeList → hypre_ParCSRCommPkgCreateApart
+  → hypre_ParCSRMatrixExtractBExt → hypre_ParCSRMatrixRAPKTHost
+  → WavePortData::Initialize → WavePortOperator::Initialize
+```
+
+This is the same `hypre_ParCSRCommPkgCreateApart` ("Assumed Partition")
+family already documented in `PALACE_CUDA_ORDER2_HANDOFF.md` §8 for the
+4-rank/main-system case, but reproduced here independently at **rank 2**,
+and stuck in the much smaller **2-D wave-port eigensolve** setup rather
+than the main 3-D system — both ranks pegged at ~99% CPU for 9+ minutes
+(longer than an entire single-rank 3-point sweep) with zero forward log
+progress. This rules out "AMG chokes once the matrix is large" as the
+explanation: it's "any hypre distributed-matrix construction deadlocks the
+instant more than one rank is involved," independent of problem size.
+
+**Confirmed NOT a CUDA-transport issue**: `ompi_info -a | grep cuda` shows
+`opal_built_with_cuda_support = false` — this Open MPI build has no CUDA
+GPU-buffer support compiled in at all, so there's no GPUDirect/CUDA-IPC
+negotiation to blame, and the hang reproduces on a plain `Device=CPU` run.
+Previously ruled out in the same investigation: `/dev/shm` exhaustion,
+forcing full (non-partial) matrix assembly.
+
+**Confirmed specific to the CUDA-enabled build, not a pre-existing/generic
+environment issue.** The exact same rank=2 CPU test (same host, same Open
+MPI 4.1.2, same WSL2/Docker environment), run against `ghcr.io/dangione/
+palace-workbench:dev` (a plain, non-CUDA image, still on Palace v0.17.0 —
+built 2026-07-25, before any of this session's CUDA/v0.18.1 work) completed
+cleanly: exit 0, 8.2s wall time, confirmed via log as genuinely `Running
+with 2 MPI processes` / `Device configuration: cpu`, exercising the exact
+same wave-port hypre assembly code path that deadlocked on the CUDA image.
+The two images share host, Open MPI version, and general environment; the
+only substantive difference is that the CUDA image's hypre is compiled with
+`HYPRE_USING_CUDA`/`HYPRE_USING_DEVICE_MEMORY` (confirmed earlier in this
+same file's SIGFPE investigation), which is plausibly why: those flags can
+make hypre allocate its MPI communication buffers via pinned/page-locked
+host memory (`cudaHostAlloc`) even on a `Device=CPU` run, since it's a
+compile-time hypre setting, not a per-run switch — and Open MPI's `ob1` PML
+may handle pinned-vs-plain host buffers differently in the exact
+Iprobe-based rendezvous protocol `hypre_DataExchangeList` uses. Not fully
+isolated from the v0.17.0→v0.18.1 version bump (the non-CUDA comparison
+image is still on v0.17.0), but the bug lives entirely inside hypre's own
+buffer construction, making the CUDA compile flags the much stronger
+suspect of the two.
+
+**Decision: shelve root-causing this, and don't make the CUDA-enabled
+image the devcontainer default.** Two independent lines of reasoning:
+- No matching upstream bug report was found (searched for
+  `hypre_DataExchangeList`/`AssumedPartition` + Open MPI + Iprobe hangs);
+  fixing it properly would mean bisecting Open MPI versions or hypre's own
+  CUDA memory-allocator code with no confirmed root cause to aim at.
+- The CUDA build's actual benefit is narrow enough that this isn't worth
+  chasing right now: GPU only helps at FE order 1 (order ≥2 SIGFPEs — see
+  above, deliberately unpatched), already forces `NumProcesses=1`
+  regardless of this bug (existing workbench behavior), and the real
+  sweep-time bottleneck (wave-port re-solve, ~84-89% of wall clock per the
+  cuDSS entry above) isn't touched by GPU, cuDSS, or CPU rank count either
+  way — it's algorithmically bound, pending upstream Palace PR #909.
+
+The regular `:dev`/`:latest` devcontainer path (non-CUDA) is unaffected and
+stays the default — multi-rank CPU has always worked there, confirmed
+above. The CUDA-enabled image/devcontainer variant remains available for
+order-1 GPU and cuDSS experimentation, but should be treated and documented
+as single-rank-only in practice, not a general-purpose replacement.
+
 ### `/dev/shm` cleanup for orphaned Open MPI `vader` segments — `palace/runner.py`, `palace/shm_cleanup.py`
 Open MPI's `vader` BTL (its shared-memory transport for intra-node inter-rank
 communication) creates one file per rank in `/dev/shm`, named

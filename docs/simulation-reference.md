@@ -52,9 +52,27 @@ things to both be true:
    error tells you which image to switch to.
 
 The `:cuda` image is built for a broad range of NVIDIA GPU generations
-(Volta through Blackwell). cuDSS (NVIDIA's GPU-resident sparse direct
-solver) is not yet wired up — GPU runs use Palace's standard iterative
-solvers, just executed on the GPU.
+(Volta through Blackwell), on Palace v0.18.1, and includes NVIDIA's cuDSS
+GPU-resident sparse direct solver as a build-time option — but there is no
+way to select it from this panel yet: the workbench doesn't write a
+`Solver.Linear` block into the generated config at all, so using cuDSS
+today means hand-editing the exported config to add
+`"Solver": {"Linear": {"Type": "cuDSS"}}` before running it externally.
+Exposing this as a real panel control is tracked as follow-up work, not yet
+implemented. Without it, GPU runs use Palace's standard iterative solvers,
+just executed on the GPU.
+
+**GPU memory is a real constraint, not just a performance knob.** Measured
+on an 8 GiB RTX 3060 Ti against a real 187k-element board: FE order 1 peaks
+around 4.0 GiB (comfortable margin), while order 2 on the same model climbs
+to ~7.8 GiB — right at the card's limit, and additionally the point where
+**order 2 GPU runs on large models can crash with SIGFPE**, a confirmed
+upstream SLEPc bug (not this workbench's code) triggered specifically when
+free GPU memory is low relative to the problem size — see
+[Troubleshooting](troubleshooting.md) for the full mechanism and current
+status. If a model's CPU-side memory usage is already well above ~6-7 GiB,
+order 2 on an 8 GiB card is a poor fit regardless of whether that specific
+crash hits; order 1 GPU doesn't have this problem at all.
 
 **Parallelism settings are handled for you on GPU.** Selecting `GPU` as the
 **Device** sets **MPI processes** to 1, **OMP threads/rank** to 0, and unticks
